@@ -18,6 +18,8 @@ using System.Threading;
 namespace Follower;
 public class Follower : BaseSettingsPlugin<FollowerSettings>
 {
+    private AutoParty _autoParty;
+    private PartyTeleport _partyTeleport;
 private Random random = new Random();
     private Camera Camera => GameController.IngameState.Camera;
     private Dictionary<uint, Entity> _areaTransitions = new Dictionary<uint, Entity>();
@@ -51,6 +53,8 @@ private Random random = new Random();
         Input.RegisterKey(Settings.ToggleFollower.Value);
         Settings.ToggleFollower.OnValueChanged += () => { Input.RegisterKey(Settings.ToggleFollower.Value); };
 
+        _autoParty = new AutoParty(this);
+        _partyTeleport = new PartyTeleport(this);
         return base.Initialise();
     }
 
@@ -178,6 +182,8 @@ private Random random = new Random();
 
     public override void Render()
     {
+        _autoParty?.Tick();
+        _partyTeleport?.Tick();
 
         //Dont run logic if we're dead!
         if (!GameController.Player.IsAlive)
@@ -301,7 +307,7 @@ if (Settings.ToggleFollower.PressedOnce())
 
                     if (true && CheckDashTerrain(FollowerInternals.MathEx.WorldToGrid(currentTask.WorldPosition)))
                         return;
-Mouse.SetCursorPosHuman2(WorldToValidScreenPosition(currentTask.WorldPosition));
+if (!Mouse.IsGuardLocked) Mouse.SetCursorPosHuman2(WorldToValidScreenPosition(currentTask.WorldPosition));
                     Thread.Sleep(random.Next(25) + 30);
                     Input.KeyDown(Settings.MovementKey);
                     Thread.Sleep(random.Next(25) + 30);
@@ -347,13 +353,13 @@ Mouse.SetCursorPosHuman2(WorldToValidScreenPosition(currentTask.WorldPosition));
                         {
                             //Click the transition
                             Input.KeyUp(Settings.MovementKey);
-                            Mouse.SetCursorPosAndLeftClickHuman(screenPos, 100);
+                            if (!Mouse.IsGuardLocked) Mouse.SetCursorPosAndLeftClickHuman(screenPos, 100);
                             _nextBotAction = DateTime.Now.AddSeconds(1);
                         }
                         else
                         {
                             //Walk towards the transition
-                            Mouse.SetCursorPosHuman2(screenPos);
+                            if (!Mouse.IsGuardLocked) Mouse.SetCursorPosHuman2(screenPos);
                             Thread.Sleep(random.Next(25) + 30);
                             Input.KeyDown(Settings.MovementKey);
                             Thread.Sleep(random.Next(25) + 30);
@@ -372,7 +378,7 @@ Mouse.SetCursorPosHuman2(WorldToValidScreenPosition(currentTask.WorldPosition));
                             var screenPos = WorldToValidScreenPosition(currentTask.WorldPosition);
                             Input.KeyUp(Settings.MovementKey);
                             Thread.Sleep(Settings.BotInputFrequency);
-                            Mouse.SetCursorPosAndLeftClickHuman(screenPos, 100);
+                            if (!Mouse.IsGuardLocked) Mouse.SetCursorPosAndLeftClickHuman(screenPos, 100);
                             _nextBotAction = DateTime.Now.AddSeconds(1);
                         }
                         currentTask.AttemptCount++;

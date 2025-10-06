@@ -13,8 +13,44 @@ using ExileCore2.Shared;
 
 namespace Follower
 {
+    // Global guard to temporarily disable mouse movement when UI is interacting
+    public static class MouseGuard
+    {
+        private static long _lockUntilTicks;
+        public static void Lock(TimeSpan duration)
+        {
+            var until = DateTime.UtcNow.Add(duration).Ticks;
+            System.Threading.Interlocked.Exchange(ref _lockUntilTicks, until);
+        }
+        public static bool IsLocked
+        {
+            get
+            {
+                return DateTime.UtcNow.Ticks < System.Threading.Interlocked.Read(ref _lockUntilTicks);
+            }
+        }
+    }
+
     public class Mouse
     {
+        [System.Runtime.InteropServices.DllImport("user32.dll")] private static extern int GetSystemMetrics(int nIndex);
+        private static bool IsFinite(float v) => !(float.IsNaN(v) || float.IsInfinity(v));
+        private static bool IsPointReasonable(Vector2 pt)
+        {
+            if (!IsFinite(pt.X) || !IsFinite(pt.Y)) return false;
+            // very top-left and negative coordinates are suspicious
+            if (pt.X < 5 || pt.Y < 5) return false;
+            try
+            {
+                var screenW = GetSystemMetrics(0);
+                var screenH = GetSystemMetrics(1);
+                if (pt.X >= screenW - 5 || pt.Y >= screenH - 5) return false;
+            }
+            catch { /* ignore */ }
+            return true;
+        }
+        public static bool IsGuardLocked => MouseGuard.IsLocked;
+
         public const int MOUSEEVENTF_MOVE = 0x0001;
         public const int MouseeventfLeftdown = 0x02;
         public const int MouseeventfLeftup = 0x04;
@@ -94,6 +130,9 @@ namespace Follower
 
         public static void SetCursorPosAndLeftClick(Vector2 coords, int extraDelay)
         {
+            if (IsGuardLocked) return;
+            if (!IsPointReasonable(coords)) return;
+    
             var posX = (int)coords.X;
             var posY = (int)coords.Y;
             SetCursorPos(posX, posY);
@@ -186,6 +225,9 @@ namespace Follower
 
         public static void SetCursorPosAndLeftClickHuman(Vector2 coords, int extraDelay)
         {
+            if (IsGuardLocked) return;
+            if (!IsPointReasonable(coords)) return;
+    
             SetCursorPosition(coords);
             Thread.Sleep(MovementDelay + extraDelay);
             LeftMouseDown();
@@ -195,6 +237,9 @@ namespace Follower
 
         public static void SetCursorPos(Vector2 vec)
         {
+            if (IsGuardLocked) return;
+            if (!IsPointReasonable(vec)) return;
+    
             SetCursorPos((int)vec.X, (int)vec.Y);
         }
 
@@ -223,6 +268,9 @@ namespace Follower
 
         public static void SetCursorPosHuman2(Vector2 vec)
         {
+            if (IsGuardLocked) return;
+            if (!IsPointReasonable(vec)) return;
+    
             var step = (float)Math.Sqrt(Vector2.Distance(GetCursorPositionVector(), vec)) * SpeedMouse / 20;
 
             if (step > 6)
