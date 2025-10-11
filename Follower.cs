@@ -18,6 +18,8 @@ using System.Threading;
 namespace Follower;
 public class Follower : BaseSettingsPlugin<FollowerSettings>
 {
+    private const int SPRINT_HOLD_TO_START_MS = 1900;
+    private const int SPRINT_RELEASE_STABLE_MS = 250;
     private AutoParty _autoParty;
     private PartyTeleport _partyTeleport;
 private Random random = new Random();
@@ -41,6 +43,23 @@ private Random random = new Random();
 
     private List<TaskNode> _tasks = new List<TaskNode>();
     private DateTime _nextBotAction = DateTime.Now;
+
+    private DateTime _nextSprintAt = DateTime.MinValue;
+
+    private enum SprintFsm { Idle, Holding }
+
+    private float _distEwma = 0f;
+    private DateTime _releaseGateStart = DateTime.MinValue;
+    
+    private SprintFsm _sprintFsmState = SprintFsm.Idle;
+    private DateTime _sprintHoldUntil = DateTime.MinValue;
+    private DateTime _nextSprintAllowed = DateTime.MinValue;
+    private bool _sprintKeyDown = false;
+    
+    private bool _sprintHeld = false;
+    private DateTime _lastSprintToggle = DateTime.MinValue;
+
+    
 
     private int _numRows, _numCols;
     private byte[,] _tiles;
@@ -305,7 +324,9 @@ if (Settings.ToggleFollower.PressedOnce())
                 case TaskNode.TaskNodeType.Movement:
                     _nextBotAction = DateTime.Now.AddMilliseconds(Settings.BotInputFrequency + random.Next(Settings.BotInputFrequency));
 
-                    if (true && CheckDashTerrain(FollowerInternals.MathEx.WorldToGrid(currentTask.WorldPosition)))
+                                                            UpdateDodgeSprintFSM();
+UpdateDodgeSprintFSM();
+if (false && CheckDashTerrain(currentTask.WorldPosition))
                         return;
 if (!Mouse.IsGuardLocked) Mouse.SetCursorPosHuman2(WorldToValidScreenPosition(currentTask.WorldPosition));
                     Thread.Sleep(random.Next(25) + 30);
@@ -394,10 +415,172 @@ if (!Mouse.IsGuardLocked) Mouse.SetCursorPosHuman2(WorldToValidScreenPosition(cu
         DrawPath();
     }
 
-    private bool CheckDashTerrain(Vector2 targetPosition)
+    
+    
+    // NUDO TODO: Replace this with real terrain lookup from ExileCore2 (e.g., GameController.IngameState.Data.Terrain)
+    private static byte GetTile(int x, int y)
     {
+        // 255 = blocked, 0 = walkable; default safe is walkable.
+        return 0;
+    }
+    
+    
+    // Attempts to trigger a Sprint if leader is too far while close-follow is enabled.
+    
+    
+    private void UpdateDodgeSprintFSM()
+    {
+        try
+        {
+            if (!(Settings.IsSprintEnabled?.Value ?? false))
+            {
+                if (_sprintKeyDown) { Input.KeyUp(Settings.DodgeSprintKey); _sprintKeyDown = false; }
+                _sprintFsmState = SprintFsm.Idle;
+                return;
+            }
+
+            var leader = GetFollowingTarget();
+            if (leader == null)
+            {
+                if (_sprintKeyDown) { Input.KeyUp(Settings.DodgeSprintKey); _sprintKeyDown = false; }
+                _sprintFsmState = SprintFsm.Idle;
+                return;
+            }
+
+            var now = DateTime.Now;
+            var dist = Vector3.Distance(GameController.Player.Pos, leader.Pos);
+            // distance smoothing to reduce oscillations
+            if (_distEwma <= 0f) _distEwma = dist;
+            _distEwma = (float)(0.8 * _distEwma + 0.2 * dist);
+
+            var startFar = Settings.SprintDistanceThreshold.Value;
+            var releaseNear = Math.Max(10, (int)(startFar * 0.7));
+            bool followGate = (Settings.IsCloseFollowEnabled?.Value ?? false) || (true /* always when far */);
+
+            switch (_sprintFsmState)
+            {
+                case SprintFsm.Idle:
+                    if (followGate && _distEwma >= startFar && now >= _nextSprintAllowed)
+                    {
+                        Input.KeyDown(Settings.DodgeSprintKey);
+                        _sprintKeyDown = true;
+                        _sprintHoldUntil = now.AddMilliseconds(SPRINT_HOLD_TO_START_MS);
+                        _releaseGateStart = DateTime.MinValue;
+                        _sprintFsmState = SprintFsm.Holding;
+                    }
+                    break;
+
+                case SprintFsm.Holding:
+                    // must hold at least until _sprintHoldUntil
+                    if (now < _sprintHoldUntil) break;
+
+                    // after min-hold, continue holding until distance is stably below release threshold
+                    if (_distEwma <= releaseNear)
+                    {
+                        if (_releaseGateStart == DateTime.MinValue)
+                            _releaseGateStart = now;
+                        var stableMs = (now - _releaseGateStart).TotalMilliseconds;
+                        if (stableMs >= SPRINT_RELEASE_STABLE_MS)
+                        {
+                            Input.KeyUp(Settings.DodgeSprintKey);
+                            _sprintKeyDown = false;
+                            _sprintFsmState = SprintFsm.Idle;
+                            _nextSprintAllowed = now.AddMilliseconds(Settings.SprintRetriggerCooldownMs.Value);
+                        }
+                    }
+                    else
+                    {
+                        _releaseGateStart = DateTime.MinValue; // not yet stable
+                    }
+                    break;
+            }
+        }
+        catch
+        {
+            // never throw from render/update
+        }
+    }
+    
+    private bool CheckDashTerrain(Vector3 targetWorld)
+    {
+        // Purpose: detect if dashing (using dash key) helps to traverse short wall segments by moving cursor to dash destination and firing dash key.
+        try
+        {
+            var playerGrid = GameController.Player.GridPos;
+            var targetPosition = FollowerInternals.MathEx.WorldToGrid(targetWorld);
+            var distance = Vector2.Distance(playerGrid, targetPosition);
+            var dir = targetPosition - playerGrid;
+            if (dir == Vector2.Zero) return false;
+            dir = Vector2.Normalize(dir);
+
+            var distanceBeforeWall = 0;
+            var distanceInWall = 0;
+            var shouldDash = false;
+
+            for (var i = 0; i < 500; i++)
+            {
+                var v2Point = playerGrid + i * dir;
+                var pt = new System.Drawing.Point((int)Math.Round(v2Point.X), (int)Math.Round(v2Point.Y));
+                // Read tile info via internal helper if available
+                byte tile = 0;
+                try
+                {
+                    tile = GetTile(pt.X, pt.Y);
+                }
+                catch
+                {
+                    // If terrain reader unavailable, abort dash
+                    return false;
+                }
+
+                // Interpret tile: 255 == invalid/blocked, other values walkable
+                if (tile == 255)
+                {
+                    // inside wall
+                    distanceInWall++;
+                    if (distanceInWall > 20)
+                    {
+                        shouldDash = false;
+                        break;
+                    }
+                }
+                else
+                {
+                    // walkable
+                    if (distanceInWall > 0)
+                    {
+                        // we have emerged from wall after some in-wall length -> candidate for dash
+                        shouldDash = true;
+                        break;
+                    }
+                    distanceBeforeWall++;
+                    if (distanceBeforeWall > 10)
+                    {
+                        break;
+                    }
+                }
+            }
+
+            if (distanceBeforeWall > 10 || distanceInWall < 5)
+                shouldDash = false;
+
+            if (shouldDash)
+            {
+                _nextBotAction = DateTime.Now.AddMilliseconds(500 + new Random().Next(Settings.BotInputFrequency));
+                // Move cursor to target world position and perform dash key press
+                var worldPos = FollowerInternals.MathEx.GridToWorld(targetPosition, targetWorld.Z);
+                Mouse.SetCursorPos(WorldToValidScreenPosition(worldPos));
+                Thread.Sleep(25);
+                Input.KeyDown(Settings.DodgeSprintKey);
+                Thread.Sleep(25);
+                Input.KeyUp(Settings.DodgeSprintKey);
+                return true;
+            }
+        }
+        catch { }
         return false;
     }
+    
 
     private Entity GetFollowingTarget()
     {

@@ -16,6 +16,13 @@ public RangeNode<int> ClearPathDistance { get; set; } = new RangeNode<int>(500, 
 public RangeNode<int> RandomClickOffset { get; set; } = new RangeNode<int>(10, 1, 100);
 public TextNode LeaderName { get; set; } = new TextNode("");
 public HotkeyNode MovementKey { get; set; } = Keys.T;
+        
+    // --- Sprint settings ---
+    [Menu("Allow Dodge/Sprint")] public ToggleNode IsSprintEnabled { get; set; } = new ToggleNode(true);
+    [Menu("Sprint Key")] public HotkeyNode DodgeSprintKey { get; set; } = Keys.S; // single key for dodge & sprint in PoE2
+    [Menu("Sprint distance to leader (world units)")] public RangeNode<int> SprintDistanceThreshold { get; set; } = new RangeNode<int>(500, 50, 2000);
+
+                        
 public ToggleNode IsCloseFollowEnabled { get; set; } = new ToggleNode(false);
 
 [Menu("Auto Party")]
@@ -53,4 +60,9 @@ public RangeNode<int> TpConfirmTimeoutMs { get; set; } = new RangeNode<int>(2500
 
 [Menu("Teleport confirm retries")]
 public RangeNode<int> TpConfirmRetries { get; set; } = new RangeNode<int>(2, 0, 5);
+    // --- Dodge/Sprint unified tuning ---
+        
+        [Menu("Sprint re-trigger (ms)")]
+    public RangeNode<int> SprintRetriggerCooldownMs { get; set; } = new RangeNode<int>(5000, 500, 15000);
+        
 }

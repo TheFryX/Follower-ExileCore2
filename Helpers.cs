@@ -50,3 +50,11 @@ namespace FollowerInternals
         public static RectangleF ToHudRect(System.Drawing.RectangleF r) => new RectangleF(r.X, r.Y, r.Width, r.Height);
     }
 }
+
+
+    // NUDO TODO: Wire this to real terrain API in ExileCore2 (Data.Terrain or similar)
+    // For now, a safe stub that reports 'walkable' (0). Replace with real tile fetch for dash heuristics.
+    public static class TerrainReader
+    {
+        public static byte GetTile(int x, int y) => 0;
+    }
