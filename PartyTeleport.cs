@@ -214,9 +214,27 @@ namespace Follower
                 dynamic party = UI?.PartyElement;
                 if (party == null) return false;
 
-                bool Visible(dynamic n) { try { return (bool)n.IsVisible; } catch { return false; } }
-                string TextOf(dynamic n) { try { return (string)n.Text; } catch { return null; } }
-                RectangleF RectOf(dynamic n) { try { return n.GetClientRect(); } catch { return new RectangleF(); } }
+	                static bool Visible(dynamic n) { try { return (bool)n.IsVisible; } catch { return false; } }
+	                static bool Active(dynamic n) { try { return (bool)n.IsActive; } catch { return true; } }
+	                static string TextOf(dynamic n) { try { return (string)n.Text; } catch { return null; } }
+	                static RectangleF RectOf(dynamic n) { try { return n.GetClientRect(); } catch { return new RectangleF(); } }
+
+	                static IEnumerable<dynamic> Descendants(dynamic root, int maxDepth)
+	                {
+	                    if (root == null || maxDepth < 0) yield break;
+	                    yield return root;
+	                    if (maxDepth == 0) yield break;
+	                    dynamic kids = null; try { kids = root.Children; } catch { kids = null; }
+	                    if (kids == null) yield break;
+	                    int n = 0; try { n = (int)kids.Count; } catch { n = 0; }
+	                    for (int i = 0; i < n; i++)
+	                    {
+	                        dynamic ch = null; try { ch = kids[i]; } catch { ch = null; }
+	                        if (ch == null) continue;
+	                        foreach (var d in Descendants(ch, maxDepth - 1))
+	                            yield return d;
+	                    }
+	                }
 
                 dynamic rows = null;
                 try { rows = party.Children[0]?.Children; } catch { }
@@ -241,37 +259,57 @@ namespace Follower
 
                     if (!isLeaderRow && !FindTextRecursive(row, leaderName)) continue;
 
-                    RectangleF nameRect = RectOf(row);
-                    try { nameRect = row.Children[0].GetClientRect(); } catch { }
-                    dynamic kids = null; try { kids = row.Children; } catch { }
-                    int kcount = 0; try { kcount = (int)kids.Count; } catch { }
+	                    // NOTE: after recent PoE2 UI updates, the teleport icon started exposing a glyph "Text"
+	                    // (private-use character). The old logic filtered out non-empty text which made TP stop.
+	                    // We now use a geometry + activity heuristic and scan a few levels deep.
+	                    var rowRect = RectOf(row);
+	                    var nameRect = rowRect;
+	                    try { nameRect = row.Children[0].GetClientRect(); } catch { /* ignore */ }
 
-                    (dynamic el, float area)? best1 = null;
-                    (dynamic el, float area)? best2 = null;
+	                    dynamic bestEl = null;
+	                    var bestScore = float.PositiveInfinity;
 
-                    for (int k = 0; k < kcount; k++)
-                    {
-                        dynamic ch = null; try { ch = kids[k]; } catch { }
-                        if (ch == null || !Visible(ch)) continue;
-                        var txt = TextOf(ch);
-                        if (!string.IsNullOrEmpty(txt)) continue;
-                        var r = RectOf(ch);
-                        if (r.Width <= 0 || r.Height <= 0) continue;
-                        bool leftOfName = r.X < nameRect.X;
-                        if (!leftOfName) continue;
-                        float area = r.Width * r.Height;
-                        if (area < 10 || area > 4096) continue;
-                        if (best1 == null || area < best1.Value.area) { best2 = best1; best1 = (ch, area); }
-                        else if (best2 == null || area < best2.Value.area) { best2 = (ch, area); }
-                    }
+	                    foreach (var el in Descendants(row, maxDepth: 4))
+	                    {
+	                        if (el == null || !Visible(el) || !Active(el)) continue;
+	
+	                        var r = RectOf(el);
+	                        if (r.Width <= 0 || r.Height <= 0) continue;
 
-                    if (best1?.el != null) { ClickCenter(RectOf(best1.Value.el)); MarkTeleportAttemptStarted(); return true; }
-                    if (best2?.el != null)
-                    {
-                        var r = RectOf(best2.Value.el);
-                        r = new RectangleF(r.X + r.Width * 0.35f, r.Y + r.Height * 0.5f, r.Width, r.Height);
-                        ClickCenter(r); MarkTeleportAttemptStarted(); return true;
-                    }
+	                        // Must be within the row band vertically.
+	                        if (r.Center.Y < rowRect.Y - 5 || r.Center.Y > rowRect.Y + rowRect.Height + 5) continue;
+
+	                        // Teleport icon is on the left side of the name.
+	                        if (r.Center.X >= nameRect.X) continue;
+
+	                        // Reject obvious text blocks: very wide elements or elements containing leader name.
+	                        var t = TextOf(el);
+	                        if (!string.IsNullOrEmpty(t) && t.IndexOf(leaderName, StringComparison.OrdinalIgnoreCase) >= 0)
+	                            continue;
+	
+	                        // Typical icon sizes: 12..64px, roughly square.
+	                        var area = r.Width * r.Height;
+	                        if (area < 64 || area > 7000) continue;
+	                        var aspect = r.Width > r.Height ? (r.Width / r.Height) : (r.Height / r.Width);
+	                        if (aspect > 2.2f) continue;
+
+	                        // Score: prefer smaller, square-ish, closest to the name from the left.
+	                        var gapToName = Math.Max(0f, nameRect.X - r.Right);
+	                        var score = (area * 0.01f) + (gapToName * 0.15f) + ((aspect - 1f) * 2.5f);
+	
+	                        if (score < bestScore)
+	                        {
+	                            bestScore = score;
+	                            bestEl = el;
+	                        }
+	                    }
+
+	                    if (bestEl != null)
+	                    {
+	                        ClickCenter(RectOf(bestEl));
+	                        MarkTeleportAttemptStarted();
+	                        return true;
+	                    }
                 }
             }
             catch (Exception ex) { _plugin.LogMessage("PartyTeleport error: " + ex.Message, 2); }
@@ -291,19 +329,80 @@ namespace Follower
                 try { node = popup.Children[0]?.Children[0]; } catch { node = null; }
                 if (node == null) return false;
 
-                string text = null;
-                try { text = (string)node.Children[0]?.Text; } catch { }
-                if (string.IsNullOrEmpty(text) || !text.StartsWith("Are you sure you want to teleport", StringComparison.OrdinalIgnoreCase))
-                    return false;
+	                string text = null;
+	                try { text = (string)node.Children[0]?.Text; } catch { /* ignore */ }
+	                if (string.IsNullOrWhiteSpace(text)) return false;
 
-                dynamic okBtn = null;
-                try { okBtn = node.Children[3]?.Children[0]; } catch { okBtn = null; }
-                if (okBtn == null) return false;
+	                // UI text is localized/variable; keep a loose check.
+	                var looksLikeConfirm =
+	                    text.IndexOf("teleport", StringComparison.OrdinalIgnoreCase) >= 0 &&
+	                    (text.IndexOf("sure", StringComparison.OrdinalIgnoreCase) >= 0 || text.IndexOf("confirm", StringComparison.OrdinalIgnoreCase) >= 0);
+	                if (!looksLikeConfirm) return false;
 
-                var r = okBtn.GetClientRect();
-                ClickCenter(r);
-                MarkTeleportAttemptStarted();
-                return true;
+	                // Prefer an explicit OK/Yes button; otherwise click the right-most bottom button.
+	                dynamic bestBtn = null;
+	                RectangleF bestRect = default;
+	
+	                void Consider(dynamic btn)
+	                {
+	                    if (btn == null) return;
+	                    bool vis; try { vis = btn.IsVisible == true; } catch { vis = true; }
+	                    if (!vis) return;
+	                    RectangleF r; try { r = btn.GetClientRect(); } catch { return; }
+	                    if (r.Width < 60 || r.Height < 18) return;
+	
+	                    string bt = null; try { bt = (string)btn.Text; } catch { bt = null; }
+	                    if (!string.IsNullOrEmpty(bt) &&
+	                        (bt.Equals("OK", StringComparison.OrdinalIgnoreCase) ||
+	                         bt.Equals("Yes", StringComparison.OrdinalIgnoreCase) ||
+	                         bt.IndexOf("accept", StringComparison.OrdinalIgnoreCase) >= 0))
+	                    {
+	                        bestBtn = btn;
+	                        bestRect = r;
+	                        return;
+	                    }
+
+	                    // Fallback heuristic: keep the right-most candidate.
+	                    if (bestBtn == null || r.X > bestRect.X)
+	                    {
+	                        bestBtn = btn;
+	                        bestRect = r;
+	                    }
+	                }
+
+	                try
+	                {
+	                    dynamic btnContainer = null;
+	                    try { btnContainer = node.Children[3]; } catch { btnContainer = null; }
+	                    if (btnContainer != null)
+	                    {
+	                        dynamic kids = null; try { kids = btnContainer.Children; } catch { kids = null; }
+	                        int n = 0; try { n = (int)kids.Count; } catch { n = 0; }
+	                        for (int i = 0; i < n; i++)
+	                        {
+	                            dynamic b = null; try { b = kids[i]; } catch { b = null; }
+	                            Consider(b);
+	                        }
+	                    }
+	                }
+	                catch { /* ignore */ }
+
+	                if (bestBtn == null)
+	                {
+	                    // Last resort: scan a few descendants and pick something button-shaped.
+	                    dynamic kids = null; try { kids = node.Children; } catch { kids = null; }
+	                    int n = 0; try { n = (int)kids.Count; } catch { n = 0; }
+	                    for (int i = 0; i < n; i++)
+	                    {
+	                        dynamic b = null; try { b = kids[i]; } catch { b = null; }
+	                        Consider(b);
+	                    }
+	                }
+
+	                if (bestBtn == null) return false;
+	                ClickCenter(bestRect);
+	                MarkTeleportAttemptStarted();
+	                return true;
             }
             catch { return false; }
         }
