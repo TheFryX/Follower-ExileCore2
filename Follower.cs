@@ -201,20 +201,27 @@ private Random random = new Random();
 
     public override void Render()
     {
-        _autoParty?.Tick();
-        _partyTeleport?.Tick();
+//Dont run logic if we're dead!
+if (!GameController.Player.IsAlive)
+    return;
 
-        //Dont run logic if we're dead!
-        if (!GameController.Player.IsAlive)
-            return;
+// Hotkey toggle (pause the whole plugin logic)
 if (Settings.ToggleFollower.PressedOnce())
-        {
-            Settings.IsFollowEnabled.SetValueNoEvent(!Settings.IsFollowEnabled.Value);
-            _tasks = new List<TaskNode>();
-        }
+{
+    Settings.IsFollowEnabled.SetValueNoEvent(!Settings.IsFollowEnabled.Value);
+    _tasks = new List<TaskNode>();
+}
 
-        if (!Settings.IsFollowEnabled.Value)
-            return;
+if (!Settings.IsFollowEnabled.Value)
+    return;
+
+// Optional safety: when inventory is open, do not move/click/teleport.
+if (IsInventoryOpen())
+    return;
+
+_autoParty?.Tick();
+_partyTeleport?.Tick();
+
 //Cache the current follow target (if present)
         _followTarget = GetFollowingTarget();
         if (_followTarget != null)
@@ -701,5 +708,97 @@ if (!Mouse.IsGuardLocked) Mouse.SetCursorPosHuman2(WorldToValidScreenPosition(cu
         }
     
     }
+
+
+
+private bool IsInventoryOpen()
+{
+    if (!Settings.PauseWhenInventoryOpen.Value) return false;
+
+    try
+    {
+        var ingame = GameController.IngameState;
+        var ui = ingame?.IngameUi;
+        if (ui == null) return false;
+
+        // Prefer the actual "open right panel" inventory, because some root inventory widgets
+        // can remain visible even when the panel is closed.
+        object? panel =
+            TryGetNestedProperty(ui, "OpenRightPanel", "InventoryPanel") ??
+            TryGetProperty(ui, "InventoryPanel") ??
+            TryGetProperty(ui, "Inventory") ??
+            TryGetProperty(ui, "InventoryWindow");
+
+        if (panel == null) return false;
+
+        // If this is an Element-like object, rely on visibility flags + geometry.
+        // In PoE2 UI many panels remain IsActive=true even when hidden, so NEVER use IsActive alone.
+        var isVisibleLocal = GetBool(panel, "IsVisibleLocal");
+        var isVisible = GetBool(panel, "IsVisible");
+        var width = GetInt(panel, "Width");
+        var height = GetInt(panel, "Height");
+
+        // Some UI elements can report negative coordinates depending on anchoring,
+        // so position is not a reliable signal for "open".
+
+        // Inventory open heuristic:
+        // - Must be visible (locally or globally)
+        // - Must have a reasonable size (closed panels often report 0 or tiny sizes)
+        if ((isVisibleLocal || isVisible) && width >= 200 && height >= 200)
+            return true;
+
+        // Fallback flags for unusual UI models (still requires visibility).
+        return (isVisibleLocal || isVisible) && (GetBool(panel, "IsOpened") || GetBool(panel, "IsOpen"));
+    }
+    catch
+    {
+        return false;
+    }
+
+    static object? TryGetProperty(object obj, string name)
+    {
+        var t = obj.GetType();
+        var p = t.GetProperty(name, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
+        return p?.GetValue(obj);
+    }
+
+    static object? TryGetNestedProperty(object obj, string parentName, string childName)
+    {
+        var parent = TryGetProperty(obj, parentName);
+        return parent != null ? TryGetProperty(parent, childName) : null;
+    }
+
+    static bool GetBool(object obj, string prop)
+    {
+        try
+        {
+            var t = obj.GetType();
+            var p = t.GetProperty(prop, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
+            if (p == null) return false;
+            return p.GetValue(obj) is bool b && b;
+        }
+        catch { return false; }
+    }
+
+    static int GetInt(object obj, string prop)
+    {
+        try
+        {
+            var t = obj.GetType();
+            var p = t.GetProperty(prop, System.Reflection.BindingFlags.Instance | System.Reflection.BindingFlags.Public | System.Reflection.BindingFlags.NonPublic);
+            if (p == null) return 0;
+            var v = p.GetValue(obj);
+            return v switch
+            {
+                int i => i,
+                long l => unchecked((int)l),
+                float f => (int)f,
+                double d => (int)d,
+                _ => 0
+            };
+        }
+        catch { return 0; }
+    }
+}
 
 }

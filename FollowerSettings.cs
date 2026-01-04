@@ -9,6 +9,8 @@ public class FollowerSettings : ISettings
 {
     public ToggleNode Enable { get; set; } = new ToggleNode(false);
     public ToggleNode IsFollowEnabled { get; set; } = new ToggleNode(false);
+
+        public ToggleNode PauseWhenInventoryOpen { get; set; } = new ToggleNode(true);
 public HotkeyNode ToggleFollower { get; set; } = Keys.PageUp;
 public RangeNode<int> PathfindingNodeDistance { get; set; } = new RangeNode<int>(200, 10, 1000);
 public RangeNode<int> BotInputFrequency { get; set; } = new RangeNode<int>(50, 10, 250);
@@ -27,6 +29,8 @@ public ToggleNode IsCloseFollowEnabled { get; set; } = new ToggleNode(false);
 
 [Menu("Auto Party")]
 public ToggleNode AutoAcceptParty { get; set; } = new ToggleNode(true);
+
+        public ToggleNode AutoAcceptTrade { get; set; } = new ToggleNode(false);
 [Menu("Accept invites from (comma-separated)")]
 public TextNode AcceptFrom { get; set; } = new TextNode("");
 public RangeNode<int> AutoPartyPollMs { get; set; } = new RangeNode<int>(500, 200, 2000);

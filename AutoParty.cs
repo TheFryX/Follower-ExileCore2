@@ -22,7 +22,7 @@ namespace Follower
         public void Tick()
         {
             var s = _plugin.Settings;
-            if (!s.Enable || (!s.AutoAcceptParty.Value ))
+            if (!s.Enable || (!s.AutoAcceptParty.Value && !s.AutoAcceptTrade.Value))
                 return;
 
             if ((DateTime.UtcNow - _lastAttempt).TotalMilliseconds < s.AutoPartyPollMs.Value) return;
@@ -31,7 +31,7 @@ namespace Follower
             try
             {
                 if (s.AutoAcceptParty.Value)
-                    TryAcceptInvites(s.AutoAcceptParty.Value, false);
+                    TryAcceptInvites(s.AutoAcceptParty.Value, s.AutoAcceptTrade.Value);
 
             }
             catch (Exception ex)
@@ -78,9 +78,9 @@ namespace Follower
             if (!acceptParty && !acceptTrade) return;
 
             // Prefer the small popup accept; fallback to Social panel accept.
-            bool ok = FindAndClickPopupAccept();
+            bool ok = FindAndClickPopupAccept(acceptParty, acceptTrade);
             if (!ok)
-                ok = FindAndClickSocialAccept();
+                ok = FindAndClickSocialAccept(acceptParty, acceptTrade);
         }
 
         private bool InSameAreaAsLeader()
@@ -214,7 +214,7 @@ namespace Follower
         // === Helpers for accepting invite based on your UI logs ===
 
         
-private bool FindAndClickPopupAccept()
+private bool FindAndClickPopupAccept(bool acceptParty, bool acceptTrade)
 {
     try
     {
@@ -245,9 +245,13 @@ private bool FindAndClickPopupAccept()
             if (!string.IsNullOrEmpty(txt))
             {
                 if (!inviterMatched && TextMatchesAny(txt, allowed)) inviterMatched = true;
-                if (txt.IndexOf("sent you a party invite", StringComparison.OrdinalIgnoreCase) >= 0)
+                if (acceptParty && txt.IndexOf("sent you a party invite", StringComparison.OrdinalIgnoreCase) >= 0)
                 {
-                    _plugin.LogMessage($"AutoParty: found invite text at depth {depth}", 1);
+                    _plugin.LogMessage($"AutoParty: found party invite text at depth {depth}", 1);
+                    inviteFound = true;
+                }
+                {
+                    _plugin.LogMessage($"AutoParty: found trade request text at depth {depth}", 1);
                     inviteFound = true;
                 }
 
@@ -293,7 +297,7 @@ private bool FindAndClickPopupAccept()
     }
 }
 
-private bool FindAndClickSocialAccept()
+private bool FindAndClickSocialAccept(bool acceptParty, bool acceptTrade)
         {
             try
             {
