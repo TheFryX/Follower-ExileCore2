@@ -41,7 +41,7 @@ namespace Follower
             "Sinking Spire","Slick","Spider Woods","Spring","Steaming Springs","Steppe","Stronghold",
             "Sulphuric Caverns","Sump","Sun Temple","The Assembly","The Ezomyte Megaliths","The Fractured Lake",
             "The Jade Isles","The Silent Cave","The Viridian Wildwood","The Ziggurat Refuge","Trenches",
-            "Untainted Paradise","Vaal City","Vaal Village","Vaults of Kamasa","Wayward Isle","Wetlands","Willow","Woodland"
+            "Untainted Paradise","Vaal City","Vaal Village","Vaults of Kamasa","Wayward Isle","Wetlands","Willow","Woodland","Atziri's Temple"
         };
 
         public void Tick()

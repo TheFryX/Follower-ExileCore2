@@ -34,9 +34,31 @@ private Random random = new Random();
     private bool IsInHideout()
     {
         var area = GameController.Area.CurrentArea;
-        return area.IsHideout || area.Name.Contains("Hideout", StringComparison.OrdinalIgnoreCase);
+        if (area == null)
+            return false;
+
+        if (area.IsHideout || area.Name.Contains("Hideout", StringComparison.OrdinalIgnoreCase))
+            return true;
+
+        // NOTE: Do NOT treat Vaal Ruins as a hideout. The Atziri entrance there
+        // is handled via special transition logic (see AreaChange/EntityAdded),
+        // so we keep standard follow behaviour in this area.
+        // if (area.Name.Contains("Vaal Ruins", StringComparison.OrdinalIgnoreCase))
+        //     return true;
+
+        return false;
     }
 
+
+    private bool IsInAtziriEntranceArea()
+    {
+        var area = GameController.Area.CurrentArea;
+        if (area == null)
+            return false;
+
+        // Atziri entrance is inside the Vaal Ruins area.
+        return area.Name.Contains("Vaal Ruins", StringComparison.OrdinalIgnoreCase);
+    }
 
     private bool _hasUsedWP = true;
 
@@ -97,9 +119,16 @@ private Random random = new Random();
 
         //Load initial transitions!
 
-        foreach (var transition in GameController.EntityListWrapper.Entities.Where(I => I.Type == ExileCore2.Shared.Enums.EntityType.AreaTransition ||
-         I.Type == ExileCore2.Shared.Enums.EntityType.Portal ||
-         I.Type == ExileCore2.Shared.Enums.EntityType.TownPortal).ToList())
+        foreach (var transition in GameController.EntityListWrapper.Entities
+            .Where(I =>
+                I.Type == ExileCore2.Shared.Enums.EntityType.AreaTransition ||
+                I.Type == ExileCore2.Shared.Enums.EntityType.Portal ||
+                I.Type == ExileCore2.Shared.Enums.EntityType.TownPortal ||
+                (!string.IsNullOrEmpty(I.RenderName) &&
+                 I.RenderName.Contains("Atziri's Temple", StringComparison.OrdinalIgnoreCase)) ||
+                (!string.IsNullOrEmpty(I.Path) &&
+                 I.Path.Contains("Incursion/Objects/HubTransition")))
+            .ToList())
         {
             if (!_areaTransitions.ContainsKey(transition.Id))
                 _areaTransitions.Add(transition.Id, transition);
@@ -294,14 +323,32 @@ _partyTeleport?.Tick();
         //Try using transition to follow them to their map
         else if (_tasks.Count == 0 &&
             _lastTargetPosition != Vector3.Zero &&
-            IsInHideout())
+            (IsInHideout() || IsInAtziriEntranceArea()))
         {
 
-            var transOptions = _areaTransitions.Values.
-                Where(I => Vector3.Distance(_lastTargetPosition, I.Pos) < Settings.ClearPathDistance).
-                OrderBy(I => Vector3.Distance(_lastTargetPosition, I.Pos)).ToArray();
+            
+            var transOptions = _areaTransitions.Values
+                .Where(I => Vector3.Distance(_lastTargetPosition, I.Pos) < Settings.ClearPathDistance)
+                .OrderBy(I => Vector3.Distance(_lastTargetPosition, I.Pos))
+                .ToArray();
+
+            // Fallback for special cases like the Atziri's Temple entrance in Vaal Ruins:
+            // if we didn't find any transition near the last leader position, explicitly
+            // look for an "Atziri's Temple" transition and use that instead.
+            if (transOptions.Length == 0)
+            {
+                transOptions = _areaTransitions.Values
+                    .Where(I => !string.IsNullOrEmpty(I.RenderName) &&
+                                I.RenderName.Contains("Atziri's Temple", StringComparison.OrdinalIgnoreCase))
+                    .OrderBy(I => Vector3.Distance(GameController.Player.Pos, I.Pos))
+                    .ToArray();
+            }
+
             if (transOptions.Length > 0)
-                _tasks.Add(new TaskNode(transOptions[random.Next(transOptions.Length)].Pos, Settings.PathfindingNodeDistance.Value, TaskNode.TaskNodeType.Transition));
+                _tasks.Add(new TaskNode(transOptions[random.Next(transOptions.Length)].Pos,
+                    Settings.PathfindingNodeDistance.Value,
+                    TaskNode.TaskNodeType.Transition));
+
         }
 
 
@@ -625,28 +672,64 @@ if (!Mouse.IsGuardLocked) Mouse.SetCursorPosHuman2(WorldToValidScreenPosition(cu
             return null;
 }
     }
+    
     public override void EntityAdded(Entity entity)
     {
+        // Special handling for transitions that don't use the normal AreaTransition/Portal entity types.
         if (!string.IsNullOrEmpty(entity.RenderName))
-            switch (entity.Type)
+        {
+            // Atziri's Temple entrance inside Vaal Ruins behaves like a portal but uses a misc object entity type.
+            // Treat it as an area transition so the follower can path to and click it.
+            if (entity.RenderName.Contains("Atziri's Temple", StringComparison.OrdinalIgnoreCase))
             {
-                //TODO: Handle doors and similar obstructions to movement/pathfinding
-
-                //TODO: Handle waypoint (initial claim as well as using to teleport somewhere)
-
-                //Handle clickable teleporters
-                case ExileCore2.Shared.Enums.EntityType.AreaTransition:
-                case ExileCore2.Shared.Enums.EntityType.Portal:
-                case ExileCore2.Shared.Enums.EntityType.TownPortal:
-                    if (!_areaTransitions.ContainsKey(entity.Id))
-                        _areaTransitions.Add(entity.Id, entity);
-                    break;
+                if (!_areaTransitions.ContainsKey(entity.Id))
+                    _areaTransitions.Add(entity.Id, entity);
             }
+
+            // Incursion hub transition is also not a standard AreaTransition.
+            if (entity.Path.Contains("Incursion/Objects/HubTransition"))
+            {
+                if (!_areaTransitions.ContainsKey(entity.Id))
+                    _areaTransitions.Add(entity.Id, entity);
+            }
+        }
+
+        switch (entity.Type)
+        {
+            //TODO: Handle doors and similar obstructions to movement/pathfinding
+
+            //TODO: Handle waypoint (initial claim as well as using to teleport somewhere)
+
+            //Handle clickable teleporters
+            case ExileCore2.Shared.Enums.EntityType.AreaTransition:
+            case ExileCore2.Shared.Enums.EntityType.Portal:
+            case ExileCore2.Shared.Enums.EntityType.TownPortal:
+                if (!_areaTransitions.ContainsKey(entity.Id))
+                    _areaTransitions.Add(entity.Id, entity);
+                break;
+        }
+
         base.EntityAdded(entity);
     }
 
     public override void EntityRemoved(Entity entity)
     {
+        // Special handling for non-standard transition entities (must mirror EntityAdded).
+        if (!string.IsNullOrEmpty(entity.RenderName))
+        {
+            if (entity.RenderName.Contains("Atziri's Temple", StringComparison.OrdinalIgnoreCase))
+            {
+                if (_areaTransitions.ContainsKey(entity.Id))
+                    _areaTransitions.Remove(entity.Id);
+            }
+        }
+
+        if (entity.Path.Contains("Incursion/Objects/HubTransition"))
+        {
+            if (_areaTransitions.ContainsKey(entity.Id))
+                _areaTransitions.Remove(entity.Id);
+        }
+
         switch (entity.Type)
         {
             //TODO: Handle doors and similar obstructions to movement/pathfinding
@@ -661,8 +744,10 @@ if (!Mouse.IsGuardLocked) Mouse.SetCursorPosHuman2(WorldToValidScreenPosition(cu
                     _areaTransitions.Remove(entity.Id);
                 break;
         }
+
         base.EntityRemoved(entity);
     }
+
 
 
     
