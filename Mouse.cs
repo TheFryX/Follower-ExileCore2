@@ -136,9 +136,9 @@ namespace Follower
             var posX = (int)coords.X;
             var posY = (int)coords.Y;
             SetCursorPos(posX, posY);
-            Thread.Sleep(MovementDelay + extraDelay);
+            if (extraDelay > 0) Thread.Sleep(MovementDelay + extraDelay);
             mouse_event(MouseeventfLeftdown, 0, 0, 0, 0);
-            Thread.Sleep(ClickDelay);
+            if (extraDelay > 0) Thread.Sleep(ClickDelay);
             mouse_event(MouseeventfLeftup, 0, 0, 0, 0);
         }
 
@@ -205,22 +205,9 @@ namespace Follower
 
         public static void SetCursorPosition(Vector2 end)
         {
-            var cursor = GetCursorPositionVector();
-            var stepVector2 = new Vector2();
-            var step = (float)Math.Sqrt(Vector2.Distance(cursor, end)) * 1.618f;
-            if (step > 275) step = 240;
-            stepVector2.X = (end.X - cursor.X) / step;
-            stepVector2.Y = (end.Y - cursor.Y) / step;
-            var fX = cursor.X;
-            var fY = cursor.Y;
-
-            for (var j = 0; j < step; j++)
-            {
-                fX += +stepVector2.X;
-                fY += stepVector2.Y;
-                SetCursorPosition(fX, fY);
-                Thread.Sleep(2);
-            }
+            if (IsGuardLocked) return;
+            if (!IsPointReasonable(end)) return;
+            SetCursorPos((int)end.X, (int)end.Y);
         }
 
         public static void SetCursorPosAndLeftClickHuman(Vector2 coords, int extraDelay)
@@ -229,9 +216,9 @@ namespace Follower
             if (!IsPointReasonable(coords)) return;
     
             SetCursorPosition(coords);
-            Thread.Sleep(MovementDelay + extraDelay);
+            if (extraDelay > 0) Thread.Sleep(MovementDelay + extraDelay);
             LeftMouseDown();
-            Thread.Sleep(MovementDelay + extraDelay);
+            if (extraDelay > 0) Thread.Sleep(MovementDelay + extraDelay);
             LeftMouseUp();
         }
 
@@ -270,18 +257,7 @@ namespace Follower
         {
             if (IsGuardLocked) return;
             if (!IsPointReasonable(vec)) return;
-    
-            var step = (float)Math.Sqrt(Vector2.Distance(GetCursorPositionVector(), vec)) * SpeedMouse / 20;
-
-            if (step > 6)
-                for (var i = 0; i < step; i++)
-                {
-                    var vector2 = FollowerInternals.MathEx.SmoothStep(GetCursorPositionVector(), vec, i / step);
-                    SetCursorPos((int)vector2.X, (int)vector2.Y);
-                    Thread.Sleep(5);
-                }
-            else
-                SetCursorPos(vec);
+            SetCursorPos(vec);
         }
 
         public static IEnumerator LeftClick()

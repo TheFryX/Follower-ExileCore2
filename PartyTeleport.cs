@@ -13,6 +13,7 @@ namespace Follower
         private readonly Follower _plugin;
 
         private DateTime _nextAttempt = DateTime.UtcNow.AddMilliseconds(-500);
+        private DateTime _nextConfirmCheck = DateTime.UtcNow.AddMilliseconds(-250);
         private int _retryCount;
         private bool _hideoutTpDone;
         private bool _wasInHideout;
@@ -46,13 +47,14 @@ namespace Follower
 
         public void Tick()
         {
+            using var __profileScope = _plugin.ProfileScope("PartyTeleport.Tick.Total");
             var s = _plugin.Settings;
             if (!s.Enable) return;
 
             // Pending TP handling: check success or retry
             if (_tpPending)
             {
-                string leaderNow = (s.LeaderName?.Value ?? string.Empty);
+                string leaderNow = (s.General.LeaderName?.Value ?? string.Empty);
 
                 if (IsLoading() || AreaNameChangedSinceAttempt() || InSameAreaAsLeader(leaderNow))
                 {
@@ -63,12 +65,12 @@ namespace Follower
                 }
 
                 var elapsed = (DateTime.UtcNow - _tpStartTime).TotalMilliseconds;
-                if (elapsed >= s.TpConfirmTimeoutMs.Value)
+                if (elapsed >= s.TpTrade.TpConfirmTimeoutMs.Value)
                 {
-                    if (_tpAttemptCount < s.TpConfirmRetries.Value)
+                    if (_tpAttemptCount < s.TpTrade.TpConfirmRetries.Value)
                     {
                         // Re-try: click OK if dialog is open, else open dialog again
-                        if (!(TryConfirmTeleportByPath() || TryConfirmTeleportByGeometry()))
+                        if (!TryConfirmTeleportDialog())
                         {
                             TryClickPartyTp(leaderNow);
                         }
@@ -83,17 +85,17 @@ namespace Follower
                 return; // pause normal flow while awaiting teleport
             }
 
-            if (!s.TeleportToLeader.Value) return;
+            if (!s.TpTrade.TeleportToLeader.Value) return;
 
             // Keep confirming dialog fast if it exists
-            if (s.AutoConfirmTeleportDialog.Value)
+            if (s.TpTrade.AutoConfirmTeleportDialog.Value)
             {
-                if (TryConfirmTeleportByPath() || TryConfirmTeleportByGeometry())
+                if (TryConfirmTeleportDialog())
                     return; // we just pressed OK and started pending state
             }
 
             // throttle TP attempts
-            if ((DateTime.UtcNow - _nextAttempt).TotalMilliseconds < s.TpPollMs.Value) return;
+            if ((DateTime.UtcNow - _nextAttempt).TotalMilliseconds < s.TpTrade.TpPollMs.Value) return;
             _nextAttempt = DateTime.UtcNow;
 
             var area = _plugin.GameController.Area?.CurrentArea;
@@ -103,7 +105,7 @@ namespace Follower
             if (_wasInHideout && !inAnyHideout) _hideoutTpDone = false;
             _wasInHideout = inAnyHideout;
 
-            var leader = (s.LeaderName?.Value ?? string.Empty).Trim();
+            var leader = (s.General.LeaderName?.Value ?? string.Empty).Trim();
             if (!string.IsNullOrEmpty(leader) && !string.Equals(_lastLeader, leader, StringComparison.OrdinalIgnoreCase))
             {
                 _lastLeader = leader;
@@ -126,7 +128,7 @@ namespace Follower
             // In your hideout: allow a single TP to leader HO if enabled; otherwise don't spam.
             if (inAnyHideout)
             {
-                if (s.TeleportFromHideout.Value && !_hideoutTpDone && leaderInHideout)
+                if (s.TpTrade.TeleportFromHideout.Value && !_hideoutTpDone && leaderInHideout)
                 {
                     if (TryClickPartyTp(leader)) { _hideoutTpDone = true; _retryCount++; }
                 }
@@ -139,34 +141,41 @@ namespace Follower
             // From acts/towns/etc -> try TP
             if (TryClickPartyTp(leader)) _retryCount++;
 
-            if (_retryCount > s.TpMaxRetries.Value) { _retryCount = 0; }
+            if (_retryCount > s.TpTrade.TpMaxRetries.Value) { _retryCount = 0; }
         }
 
         private string GetLeaderRowText(string leaderName)
         {
+            using var __profileScope = _plugin.ProfileScope("PartyTeleport.GetLeaderRowText");
             try
             {
-                dynamic party = UI?.PartyElement;
-                if (party == null) return null;
-                dynamic rows = null;
-                try { rows = party.Children[0]?.Children; } catch { }
-                if (rows == null) try { rows = party.Children; } catch { }
-                if (rows == null) return null;
-                int rowCount = 0; try { rowCount = (int)rows.Count; } catch { }
-                for (int i = 0; i < rowCount; i++)
-                {
-                    dynamic row = null; try { row = rows[i]; } catch { }
-                    if (row == null) continue;
-                    if (!FindTextRecursive(row, leaderName)) continue;
-                    return CollectAllText(row);
-                }
+                var row = FindLeaderPartyRow(leaderName);
+                return row == null ? null : CollectDirectPartyRowText(row);
             }
-            catch { }
-            return null;
+            catch { return null; }
+        }
+
+        private string CollectDirectPartyRowText(dynamic row)
+        {
+            using var __profileScope = _plugin.ProfileScope("PartyTeleport.CollectDirectPartyRowText");
+            try
+            {
+                if (row == null) return null;
+
+                var name = TextOf(GetChild(row, 0));
+                var location = TextOf(GetChild(row, 3));
+
+                if (!string.IsNullOrWhiteSpace(name) || !string.IsNullOrWhiteSpace(location))
+                    return string.Concat(name ?? string.Empty, " ", location ?? string.Empty).Trim();
+
+                return CollectAllText(row);
+            }
+            catch { return null; }
         }
 
         private string CollectAllText(dynamic node)
         {
+            using var __profileScope = _plugin.ProfileScope("PartyTeleport.CollectAllText");
             try
             {
                 string acc = string.Empty;
@@ -188,6 +197,7 @@ namespace Follower
 
         private bool InSameAreaAsLeader(string leaderName)
         {
+            using var __profileScope = _plugin.ProfileScope("PartyTeleport.InSameAreaAsLeader");
             try
             {
                 foreach (var ent in _plugin.GameController.Entities)
@@ -209,115 +219,166 @@ namespace Follower
 
         private bool TryClickPartyTp(string leaderName)
         {
+            using var __profileScope = _plugin.ProfileScope("PartyTeleport.TryClickPartyTp");
             try
             {
+                dynamic row = FindLeaderPartyRow(leaderName);
+                if (row == null)
+                    return false;
+
+                dynamic teleportButton = GetChild(row, 4);
+                if (!IsUsableElement(teleportButton))
+                    return false;
+
+                RectangleF rect = RectOf(teleportButton);
+                if (rect.Width <= 0 || rect.Height <= 0)
+                    return false;
+
+                ClickCenter(rect);
+                MarkTeleportAttemptStarted();
+                return true;
+            }
+            catch (Exception ex)
+            {
+                _plugin.LogMessage("PartyTeleport direct PartyElement error: " + ex.Message, 2);
+                return false;
+            }
+        }
+
+        private bool TryConfirmTeleportDialog()
+        {
+            using var __profileScope = _plugin.ProfileScope("PartyTeleport.TryConfirmTeleportDialog");
+            var now = DateTime.UtcNow;
+            if (now < _nextConfirmCheck)
+                return false;
+
+            _nextConfirmCheck = now.AddMilliseconds(250);
+            return TryConfirmTeleportByPath() || TryConfirmTeleportByGeometry();
+        }
+
+        private dynamic FindLeaderPartyRow(string leaderName)
+        {
+            using var __profileScope = _plugin.ProfileScope("PartyTeleport.FindLeaderPartyRow");
+            try
+            {
+                if (string.IsNullOrWhiteSpace(leaderName))
+                    return null;
+
                 dynamic party = UI?.PartyElement;
-                if (party == null) return false;
+                if (!IsUsableElement(party))
+                    return null;
 
-	                static bool Visible(dynamic n) { try { return (bool)n.IsVisible; } catch { return false; } }
-	                static bool Active(dynamic n) { try { return (bool)n.IsActive; } catch { return true; } }
-	                static string TextOf(dynamic n) { try { return (string)n.Text; } catch { return null; } }
-	                static RectangleF RectOf(dynamic n) { try { return n.GetClientRect(); } catch { return new RectangleF(); } }
+                // Current PoE2 party UI shape observed from DebugWindow:
+                // IngameState.IngameUi.PartyElement -> Children[0] -> Children[0] = party row
+                // row.Children[0] = player name, [3] = location, [4] = teleport button.
+                dynamic first = GetChild(party, 0);
+                dynamic directRow = GetChild(first, 0);
+                if (IsLeaderPartyRow(directRow, leaderName))
+                    return directRow;
 
-	                static IEnumerable<dynamic> Descendants(dynamic root, int maxDepth)
-	                {
-	                    if (root == null || maxDepth < 0) yield break;
-	                    yield return root;
-	                    if (maxDepth == 0) yield break;
-	                    dynamic kids = null; try { kids = root.Children; } catch { kids = null; }
-	                    if (kids == null) yield break;
-	                    int n = 0; try { n = (int)kids.Count; } catch { n = 0; }
-	                    for (int i = 0; i < n; i++)
-	                    {
-	                        dynamic ch = null; try { ch = kids[i]; } catch { ch = null; }
-	                        if (ch == null) continue;
-	                        foreach (var d in Descendants(ch, maxDepth - 1))
-	                            yield return d;
-	                    }
-	                }
-
-                dynamic rows = null;
-                try { rows = party.Children[0]?.Children; } catch { }
-                if (rows == null) try { rows = party.Children; } catch { }
-                if (rows == null) return false;
-
-                int rowCount = 0; try { rowCount = (int)rows.Count; } catch { }
-                for (int i = 0; i < rowCount; i++)
+                // Multi-member / slightly shifted layouts: rows may be direct children of the wrapper.
+                dynamic wrapperChildren = GetChildren(first);
+                int wrapperCount = CountOf(wrapperChildren);
+                for (int i = 0; i < wrapperCount; i++)
                 {
-                    dynamic row = null; try { row = rows[i]; } catch { }
-                    if (row == null || !Visible(row)) continue;
+                    dynamic candidate = GetChild(first, i);
+                    if (IsLeaderPartyRow(candidate, leaderName))
+                        return candidate;
 
-                    bool isLeaderRow = false;
-                    try
-                    {
-                        var maybeName = TextOf(row.Children[0]?.Children[0]);
-                        if (!string.IsNullOrEmpty(maybeName) &&
-                            maybeName.IndexOf(leaderName, StringComparison.OrdinalIgnoreCase) >= 0)
-                            isLeaderRow = true;
-                    }
-                    catch { }
+                    dynamic nested = GetChild(candidate, 0);
+                    if (IsLeaderPartyRow(nested, leaderName))
+                        return nested;
+                }
 
-                    if (!isLeaderRow && !FindTextRecursive(row, leaderName)) continue;
+                // Last cheap fallback: only inspect direct PartyElement children, no global UI DFS.
+                dynamic partyChildren = GetChildren(party);
+                int partyCount = CountOf(partyChildren);
+                for (int i = 0; i < partyCount; i++)
+                {
+                    dynamic candidate = GetChild(party, i);
+                    if (IsLeaderPartyRow(candidate, leaderName))
+                        return candidate;
 
-	                    // NOTE: after recent PoE2 UI updates, the teleport icon started exposing a glyph "Text"
-	                    // (private-use character). The old logic filtered out non-empty text which made TP stop.
-	                    // We now use a geometry + activity heuristic and scan a few levels deep.
-	                    var rowRect = RectOf(row);
-	                    var nameRect = rowRect;
-	                    try { nameRect = row.Children[0].GetClientRect(); } catch { /* ignore */ }
-
-	                    dynamic bestEl = null;
-	                    var bestScore = float.PositiveInfinity;
-
-	                    foreach (var el in Descendants(row, maxDepth: 4))
-	                    {
-	                        if (el == null || !Visible(el) || !Active(el)) continue;
-	
-	                        var r = RectOf(el);
-	                        if (r.Width <= 0 || r.Height <= 0) continue;
-
-	                        // Must be within the row band vertically.
-	                        if (r.Center.Y < rowRect.Y - 5 || r.Center.Y > rowRect.Y + rowRect.Height + 5) continue;
-
-	                        // Teleport icon is on the left side of the name.
-	                        if (r.Center.X >= nameRect.X) continue;
-
-	                        // Reject obvious text blocks: very wide elements or elements containing leader name.
-	                        var t = TextOf(el);
-	                        if (!string.IsNullOrEmpty(t) && t.IndexOf(leaderName, StringComparison.OrdinalIgnoreCase) >= 0)
-	                            continue;
-	
-	                        // Typical icon sizes: 12..64px, roughly square.
-	                        var area = r.Width * r.Height;
-	                        if (area < 64 || area > 7000) continue;
-	                        var aspect = r.Width > r.Height ? (r.Width / r.Height) : (r.Height / r.Width);
-	                        if (aspect > 2.2f) continue;
-
-	                        // Score: prefer smaller, square-ish, closest to the name from the left.
-	                        var gapToName = Math.Max(0f, nameRect.X - r.Right);
-	                        var score = (area * 0.01f) + (gapToName * 0.15f) + ((aspect - 1f) * 2.5f);
-	
-	                        if (score < bestScore)
-	                        {
-	                            bestScore = score;
-	                            bestEl = el;
-	                        }
-	                    }
-
-	                    if (bestEl != null)
-	                    {
-	                        ClickCenter(RectOf(bestEl));
-	                        MarkTeleportAttemptStarted();
-	                        return true;
-	                    }
+                    dynamic nested = GetChild(GetChild(candidate, 0), 0);
+                    if (IsLeaderPartyRow(nested, leaderName))
+                        return nested;
                 }
             }
-            catch (Exception ex) { _plugin.LogMessage("PartyTeleport error: " + ex.Message, 2); }
-            return false;
+            catch { }
+
+            return null;
+        }
+
+        private bool IsLeaderPartyRow(dynamic row, string leaderName)
+        {
+            using var __profileScope = _plugin.ProfileScope("PartyTeleport.IsLeaderPartyRow");
+            try
+            {
+                if (!IsUsableElement(row))
+                    return false;
+
+                dynamic nameNode = GetChild(row, 0);
+                string text = TextOf(nameNode);
+
+                if (string.IsNullOrWhiteSpace(text))
+                    text = TextOf(GetChild(nameNode, 0));
+
+                return !string.IsNullOrWhiteSpace(text) &&
+                       text.IndexOf(leaderName, StringComparison.OrdinalIgnoreCase) >= 0;
+            }
+            catch { return false; }
+        }
+
+        private static dynamic GetChildren(dynamic node)
+        {
+            try { return node?.Children; } catch { return null; }
+        }
+
+        private static dynamic GetChild(dynamic node, int index)
+        {
+            try
+            {
+                dynamic children = node?.Children;
+                if (children == null) return null;
+                int count = CountOf(children);
+                if (index < 0 || index >= count) return null;
+                return children[index];
+            }
+            catch { return null; }
+        }
+
+        private static int CountOf(dynamic children)
+        {
+            try { return children == null ? 0 : (int)children.Count; } catch { return 0; }
+        }
+
+        private static bool IsUsableElement(dynamic node)
+        {
+            try
+            {
+                if (node == null) return false;
+                try { if (node.IsValid == false) return false; } catch { }
+                try { if (node.IsVisibleLocal == false) return false; } catch { }
+                try { if (node.IsVisible == false) return false; } catch { }
+                try { if (node.IsActive == false) return false; } catch { }
+                return true;
+            }
+            catch { return false; }
+        }
+
+        private static string TextOf(dynamic node)
+        {
+            try { return (string)node?.Text; } catch { return null; }
+        }
+
+        private static RectangleF RectOf(dynamic node)
+        {
+            try { return node.GetClientRect(); } catch { return new RectangleF(); }
         }
 
         private bool TryConfirmTeleportByPath()
         {
+            using var __profileScope = _plugin.ProfileScope("PartyTeleport.TryConfirmTeleportByPath");
             try
             {
                 dynamic popup = UI?.PopUpWindow;
@@ -413,16 +474,18 @@ namespace Follower
         /// </summary>
         private bool TryConfirmTeleportByGeometry()
         {
+            using var __profileScope = _plugin.ProfileScope("PartyTeleport.TryConfirmTeleportByGeometry");
             try
             {
-                dynamic ui = UI;
-                if (ui == null) return false;
+                dynamic popup = UI?.PopUpWindow;
+                if (popup == null) return false;
+                try { if (popup.IsVisible == false) return false; } catch { return false; }
 
                 bool Visible(dynamic n) { try { return (bool)n.IsVisible; } catch { return false; } }
-                RectangleF RectOf(dynamic n) { try { return n.GetClientRect(); } catch { return new RectangleF(); } }
+                RectangleF RectOfLocal(dynamic n) { try { return n.GetClientRect(); } catch { return new RectangleF(); } }
 
-                dynamic textNode = FindNodeContaining(ui, "ARE YOU SURE YOU WANT TO TELEPORT");
-                if (textNode == null) textNode = FindNodeContaining(ui, "sure you want to teleport");
+                dynamic textNode = FindNodeContaining(popup, "ARE YOU SURE YOU WANT TO TELEPORT");
+                if (textNode == null) textNode = FindNodeContaining(popup, "sure you want to teleport");
                 if (textNode == null) return false;
 
                 dynamic container = textNode;
@@ -430,7 +493,7 @@ namespace Follower
                 {
                     try { container = container.Parent; } catch { container = null; }
                     if (container == null) break;
-                    var r = RectOf(container);
+                    var r = RectOfLocal(container);
                     if (r.Width >= 400 && r.Height >= 150) break;
                 }
                 if (container == null) return false;
@@ -442,9 +505,9 @@ namespace Follower
                 {
                     dynamic ch = null; try { ch = kids[i]; } catch { }
                     if (ch == null || !Visible(ch)) continue;
-                    var r = RectOf(ch);
+                    var r = RectOfLocal(ch);
                     if (r.Width < 80 || r.Width > 350 || r.Height < 24 || r.Height > 90) continue;
-                    var cr = RectOf(container);
+                    var cr = RectOfLocal(container);
                     if (r.Y < cr.Y + cr.Height * 0.55f) continue;
                     candidates.Add(r);
                 }
@@ -512,16 +575,20 @@ namespace Follower
 
         private void ClickCenter(RectangleF rect)
         {
+            using var __profileScope = _plugin.ProfileScope("PartyTeleport.ClickCenter");
             try
             {
                 var c = new Vector2(rect.Center.X, rect.Center.Y);
+                _plugin.PrepareForPluginMouseAction("PartyTeleport.ClickCenter.Prepare");
                 Mouse.SetCursorPosAndLeftClick(c, 1);
+                _plugin.CompletePluginMouseAction("PartyTeleport.ClickCenter.Complete");
             }
             catch { }
         }
 
         private void MarkTeleportAttemptStarted()
         {
+            using var __profileScope = _plugin.ProfileScope("PartyTeleport.MarkTeleportAttemptStarted");
             try
             {
                 _tpPending = true;
@@ -534,6 +601,7 @@ namespace Follower
 
         private bool AreaNameChangedSinceAttempt()
         {
+            using var __profileScope = _plugin.ProfileScope("PartyTeleport.AreaNameChangedSinceAttempt");
             try
             {
                 var nm = _plugin.GameController.Area?.CurrentArea?.Name ?? string.Empty;
@@ -544,6 +612,7 @@ namespace Follower
 
         private bool IsLoading()
         {
+            using var __profileScope = _plugin.ProfileScope("PartyTeleport.IsLoading");
             // Avoid strong-typed properties that may not exist; try dynamic and UI heuristics.
             try
             {

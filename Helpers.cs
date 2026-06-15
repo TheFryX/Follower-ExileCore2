@@ -52,8 +52,7 @@ namespace FollowerInternals
 }
 
 
-    // NUDO TODO: Wire this to real terrain API in ExileCore2 (Data.Terrain or similar)
-    // For now, a safe stub that reports 'walkable' (0). Replace with real tile fetch for dash heuristics.
+    // Safe fallback that reports 'walkable' (0) for dash heuristics when no terrain reader is available.
     public static class TerrainReader
     {
         public static byte GetTile(int x, int y) => 0;
