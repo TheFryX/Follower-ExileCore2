@@ -12,6 +12,7 @@ namespace Follower
         {
             Movement,
             Transition,
+            ArenaTransition,
             Loot,
             ClaimWaypoint
         }

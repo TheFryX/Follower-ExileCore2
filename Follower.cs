@@ -31,6 +31,8 @@ public class Follower : BaseSettingsPlugin<FollowerSettings>
     private const float MIN_CURSOR_MOVE_DISTANCE_PX = 4f;
     private AutoParty _autoParty;
     private PartyTeleport _partyTeleport;
+    private PartyChatCommands _partyChatCommands;
+    private bool _pausedByPartyChatCommand;
     private SpikeProfiler _spikeProfiler;
 private Random random = new Random();
     private Camera Camera => GameController.IngameState.Camera;
@@ -42,6 +44,15 @@ private Random random = new Random();
     private const int PortalHoverDelayMs = 80;
     private DateTime _portalHoverClickAt = DateTime.MinValue;
     private uint _portalHoverEntityId;
+
+    // Boss arena entrances in maps are exposed as ground labels, not always as normal
+    // AreaTransition entities. The UI hover from the user shows:
+    // IngameUi -> ItemsOnGroundLabelsElement -> LabelsOnGroundVisible -> Label.Text == "Arena".
+    private const int ArenaTransitionHoverDelayMs = 80;
+    private DateTime _nextArenaTransitionScanAt = DateTime.MinValue;
+    private DateTime _arenaTransitionHoverClickAt = DateTime.MinValue;
+    private uint _arenaTransitionHoverEntityId;
+    private DateTime _arenaTransitionRetrySuppressedUntil = DateTime.MinValue;
 
     private Vector3 _lastTargetPosition;
     private Vector3 _lastPlayerPosition;
@@ -129,6 +140,7 @@ private Random random = new Random();
 
         _autoParty = new AutoParty(this);
         _partyTeleport = new PartyTeleport(this);
+        _partyChatCommands = new PartyChatCommands(this);
         _spikeProfiler = new SpikeProfiler(this);
         return base.Initialise();
     }
@@ -189,6 +201,8 @@ private Random random = new Random();
         _nextMovementKeyTapAt = DateTime.Now.AddMilliseconds(MIN_MOVEMENT_KEY_TAP_GAP_MS);
         _nextCursorMoveAt = DateTime.MinValue;
         _lastCursorMoveTarget = Vector2.Zero;
+        ResetPendingArenaTransitionClick();
+        _arenaTransitionRetrySuppressedUntil = DateTime.MinValue;
     }
 
     public override void AreaChange(AreaInstance area)
@@ -434,6 +448,34 @@ private Random random = new Random();
         _nextForcedInputReleaseAt = DateTime.Now.AddMilliseconds(85);
     }
 
+    internal void SetFollowEnabledFromPartyChat(bool enabled, string leaderName, string commandText)
+    {
+        using var __profileScope = ProfileScope("Follower.PartyChatCommands.SetFollowEnabled");
+
+        // Party-chat stop/start is intentionally kept as a volatile pause layer.
+        // Do not persistently flip the main IsFollowEnabled setting on -p; otherwise
+        // an old/stale chat line can leave the plugin disabled after reload.
+        _pausedByPartyChatCommand = !enabled;
+
+        if (enabled && !Settings.General.IsFollowEnabled.Value)
+            Settings.General.IsFollowEnabled.SetValueNoEvent(true);
+
+        _tasks.Clear();
+        _followTarget = null;
+        _lastTargetPosition = Vector3.Zero;
+        _lastPlayerPosition = Vector3.Zero;
+        _nextBotAction = DateTime.Now.AddMilliseconds(150);
+        ReleaseAllPluginInputsNow(force: true, reason: enabled
+            ? "Follower.PartyChatCommands.Start.Release"
+            : "Follower.PartyChatCommands.Stop.Release");
+
+        try
+        {
+            LogMessage($"PartyChatCommands: leader {leaderName} sent {commandText}; follow {(enabled ? "started" : "paused")}", 3);
+        }
+        catch { }
+    }
+
     private void QueueDodgeSprintTap(int holdMs = 25)
     {
         using var __profileScope = ProfileScope("Follower.InputScheduler.QueueDodgeSprintTap");
@@ -480,7 +522,10 @@ try
 {
 if (Settings.General.ToggleFollower.PressedOnce())
 {
-    Settings.General.IsFollowEnabled.SetValueNoEvent(!Settings.General.IsFollowEnabled.Value);
+    var nextFollowEnabled = !Settings.General.IsFollowEnabled.Value;
+    Settings.General.IsFollowEnabled.SetValueNoEvent(nextFollowEnabled);
+    if (nextFollowEnabled)
+        _pausedByPartyChatCommand = false;
     _tasks = new List<TaskNode>();
     ReleaseAllPluginInputsNow(force: true, reason: "Follower.Toggle.Release");
 }
@@ -491,9 +536,19 @@ var __autoPartyDebugHotkeyProfileStart = _spikeProfiler?.Begin("Option.AutoParty
 try { _autoParty?.TickDebugHotkey(); }
 finally { _spikeProfiler?.End("Option.AutoPartyHoverContextDumpHotkey", __autoPartyDebugHotkeyProfileStart); }
 
+var __partyChatCommandsProfileStart = _spikeProfiler?.Begin("Option.PartyChatLeaderCommands") ?? 0L;
+try { _partyChatCommands?.Tick(); }
+finally { _spikeProfiler?.End("Option.PartyChatLeaderCommands", __partyChatCommandsProfileStart); }
+
 if (!Settings.General.IsFollowEnabled.Value)
 {
     ReleaseAllPluginInputsNow(reason: "Follower.EarlyReturn.FollowDisabled.Release");
+    return;
+}
+
+if (_pausedByPartyChatCommand && (Settings.General.PartyChatLeaderCommandsEnabled?.Value ?? false))
+{
+    ReleaseAllPluginInputsNow(reason: "Follower.EarlyReturn.PartyChatPaused.Release");
     return;
 }
 
@@ -524,7 +579,13 @@ finally { _spikeProfiler?.End("Option.TeleportToLeader", __partyTeleportProfileS
         var __leaderLookupProfileStart = ProfileBegin("Follower.Target.GetFollowingTarget");
         try { _followTarget = GetFollowingTarget(); }
         finally { ProfileEnd("Follower.Target.GetFollowingTarget", __leaderLookupProfileStart); }
-        if (_followTarget != null)
+
+        // Boss arena entrances can stay visible while the leader is still visible on the
+        // same map. Scan/click the ground-label transition before normal follow planning
+        // so following movement cannot override the Arena click.
+        var arenaTransitionQueued = TryQueueArenaTransitionTask();
+
+        if (!arenaTransitionQueued && _followTarget != null)
         {
             var distanceFromFollower = Vector3.Distance(GameController.Player.Pos, _followTarget.Pos);
             //We are NOT within clear path distance range of leader. Logic can continue
@@ -792,6 +853,39 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
                         {
                             ResetPendingPortalClick();
                             _tasks.RemoveAt(0);
+                        }
+                        break;
+                    }
+
+                case TaskNode.TaskNodeType.ArenaTransition:
+                    {
+                        _nextBotAction = DateTime.Now.AddMilliseconds(SafeBotDelayMs(2));
+
+                        var target = FindVisibleArenaTransitionLabel();
+                        if (target == null)
+                        {
+                            ResetPendingArenaTransitionClick();
+                            _tasks.RemoveAt(0);
+                            break;
+                        }
+
+                        currentTask.WorldPosition = target.WorldPosition != Vector3.Zero
+                            ? target.WorldPosition
+                            : GameController.Player.Pos;
+
+                        if (TryHoverThenClickArenaTransition(target))
+                        {
+                            _nextBotAction = _arenaTransitionHoverClickAt == DateTime.MinValue
+                                ? DateTime.Now.AddSeconds(1)
+                                : DateTime.Now.AddMilliseconds(ArenaTransitionHoverDelayMs);
+                        }
+
+                        currentTask.AttemptCount++;
+                        if (currentTask.AttemptCount > Math.Max(1, Settings.General.ArenaTransitionMaxRetries.Value * 2))
+                        {
+                            ResetPendingArenaTransitionClick();
+                            _tasks.RemoveAt(0);
+                            _arenaTransitionRetrySuppressedUntil = DateTime.Now.AddMilliseconds(Math.Max(500, Settings.General.ArenaTransitionRetryCooldownMs.Value));
                         }
                         break;
                     }
@@ -1097,6 +1191,321 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
 }
     }
     
+    private bool TryQueueArenaTransitionTask()
+    {
+        using var __profileScope = ProfileScope("Follower.ArenaTransition.TryQueue");
+
+        try
+        {
+            if (!(Settings.General.AutoClickArenaTransition?.Value ?? true))
+                return false;
+
+            var now = DateTime.Now;
+            if (now < _arenaTransitionRetrySuppressedUntil)
+                return false;
+
+            if (_tasks.Any(t => t.Type == TaskNode.TaskNodeType.ArenaTransition))
+                return true;
+
+            if (now < _nextArenaTransitionScanAt)
+                return false;
+
+            // Keep this scan intentionally slow and restricted to visible labels. Enumerating UI label collections
+            // too often can stall ExileCore2 memory reads and make following jittery.
+            _nextArenaTransitionScanAt = now.AddMilliseconds(Math.Max(750, Settings.General.ArenaTransitionScanMs.Value));
+
+            var target = FindVisibleArenaTransitionLabel();
+            if (target == null)
+                return false;
+
+            // Stop normal follow/path actions while the arena label is being clicked.
+            _tasks.Clear();
+            _tasks.Add(new TaskNode(
+                target.WorldPosition != Vector3.Zero ? target.WorldPosition : GameController.Player.Pos,
+                Settings.General.ClearPathDistance.Value,
+                TaskNode.TaskNodeType.ArenaTransition));
+            ReleaseAllPluginInputsNow(force: true, reason: "Follower.ArenaTransition.Queue.ReleaseFollowMovement");
+            _nextBotAction = DateTime.Now.AddMilliseconds(80);
+            return true;
+        }
+        catch (Exception ex)
+        {
+            try { LogMessage("ArenaTransition queue error: " + ex.Message, 5); } catch { }
+            return false;
+        }
+    }
+
+    private ArenaTransitionTarget FindVisibleArenaTransitionLabel()
+    {
+        using var __profileScope = ProfileScope("Follower.ArenaTransition.FindVisibleLabel");
+
+        var wantedText = NormalizeUiText(Settings.General.ArenaTransitionLabelText?.Value);
+        if (string.IsNullOrWhiteSpace(wantedText))
+            wantedText = "Arena";
+
+        var metadataFilter = Settings.General.ArenaTransitionMetadataFilter?.Value ?? string.Empty;
+
+        try
+        {
+            dynamic ingameUi = GameController.IngameState?.IngameUi;
+            if (ingameUi == null)
+                return null;
+
+            // Low-cost path from the hover dump:
+            // IngameUi -> ItemsOnGroundLabelsElement -> LabelsOnGroundVisible -> Label.Text == "Arena".
+            // Do not enumerate LabelsOnGround here. On juiced maps it can be very large and can stall the API.
+            dynamic labelsElement = null;
+            try { labelsElement = ingameUi.ItemsOnGroundLabelsElement; } catch { labelsElement = null; }
+
+            dynamic visibleLabels = null;
+            try { visibleLabels = labelsElement?.LabelsOnGroundVisible; } catch { visibleLabels = null; }
+
+            var target = FindArenaTransitionTargetInLabelCollection(
+                visibleLabels,
+                wantedText,
+                metadataFilter,
+                maxLabelsToInspect: 32);
+            if (target != null)
+                return target;
+
+            // Compatibility fallback for ExileCore2 builds where ItemsOnGroundLabels is already the visible collection.
+            // Keep this capped. It is a fallback only and must not turn into a full ground-label sweep.
+            dynamic directLabels = null;
+            try { directLabels = ingameUi.ItemsOnGroundLabels; } catch { directLabels = null; }
+            return FindArenaTransitionTargetInLabelCollection(
+                directLabels,
+                wantedText,
+                metadataFilter,
+                maxLabelsToInspect: 64);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private ArenaTransitionTarget FindArenaTransitionTargetInLabelCollection(
+        dynamic labels,
+        string wantedText,
+        string metadataFilter,
+        int maxLabelsToInspect)
+    {
+        if (labels == null)
+            return null;
+
+        var inspected = 0;
+        try
+        {
+            foreach (dynamic groundLabel in labels)
+            {
+                if (groundLabel == null)
+                    continue;
+
+                inspected++;
+                if (inspected > maxLabelsToInspect)
+                    break;
+
+                var target = TryReadArenaTransitionTarget(groundLabel, wantedText, metadataFilter);
+                if (target != null)
+                    return target;
+            }
+        }
+        catch
+        {
+            // Some UI nodes are not enumerable in some ExileCore2 builds.
+        }
+
+        return null;
+    }
+
+    private ArenaTransitionTarget TryReadArenaTransitionTarget(dynamic groundLabel, string wantedText, string metadataFilter)
+    {
+        try
+        {
+            dynamic labelElement = null;
+            try { labelElement = groundLabel.Label; } catch { labelElement = null; }
+            if (labelElement == null)
+                return null;
+
+            var text = NormalizeUiText(UiTextOf(labelElement));
+            if (!string.Equals(text, wantedText, StringComparison.OrdinalIgnoreCase))
+                return null;
+
+            dynamic itemOnGround = null;
+            try { itemOnGround = groundLabel.ItemOnGround; } catch { itemOnGround = null; }
+
+            var path = PathOf(itemOnGround);
+            if (!string.IsNullOrWhiteSpace(metadataFilter) &&
+                (string.IsNullOrWhiteSpace(path) || path.IndexOf(metadataFilter.Trim(), StringComparison.OrdinalIgnoreCase) < 0))
+                return null;
+
+            if (!IsVisibleElement(labelElement))
+                return null;
+
+            var center = CenterOfElement(labelElement);
+            if (center == Vector2.Zero)
+                return null;
+
+            return new ArenaTransitionTarget
+            {
+                LabelElement = labelElement,
+                LabelCenter = center,
+                WorldPosition = PositionOf(itemOnGround),
+                EntityId = IdOf(itemOnGround),
+                Text = text,
+                MetadataPath = path
+            };
+        }
+        catch
+        {
+            // UI memory can mutate while the tree is being read. Skip this label only.
+            return null;
+        }
+    }
+
+    private bool TryHoverThenClickArenaTransition(ArenaTransitionTarget target)
+    {
+        using var __profileScope = ProfileScope("Follower.ArenaTransition.TryHoverThenClick");
+        if (target == null)
+            return false;
+
+        var now = DateTime.Now;
+        var entityId = target.EntityId;
+        var clickPos = target.LabelCenter;
+        var offset = Math.Max(0, Settings.General.RandomClickOffset.Value);
+        if (offset > 0)
+        {
+            clickPos += new Vector2(
+                random.Next(-offset, offset + 1),
+                random.Next(-Math.Max(1, offset / 2), Math.Max(1, offset / 2) + 1));
+        }
+
+        if (_arenaTransitionHoverEntityId != entityId || _arenaTransitionHoverClickAt == DateTime.MinValue)
+        {
+            PrepareForPluginMouseAction("Follower.ArenaTransition.Hover.Prepare");
+            if (!Mouse.IsGuardLocked) Mouse.SetCursorPosHuman2(clickPos);
+            _arenaTransitionHoverEntityId = entityId;
+            _arenaTransitionHoverClickAt = now.AddMilliseconds(ArenaTransitionHoverDelayMs);
+            return true;
+        }
+
+        if (now < _arenaTransitionHoverClickAt)
+            return true;
+
+        PrepareForPluginMouseAction("Follower.ArenaTransition.Click.Prepare");
+        if (!Mouse.IsGuardLocked) Mouse.SetCursorPosAndLeftClickHuman(clickPos, 0);
+        CompletePluginMouseAction("Follower.ArenaTransition.Click.Complete");
+        ResetPendingArenaTransitionClick();
+        _nextBotAction = now.AddSeconds(1);
+
+        try { LogMessage($"ArenaTransition: clicked '{target.Text}' ({target.MetadataPath})", 3); } catch { }
+        return true;
+    }
+
+    private void ResetPendingArenaTransitionClick()
+    {
+        _arenaTransitionHoverEntityId = 0;
+        _arenaTransitionHoverClickAt = DateTime.MinValue;
+    }
+
+    private static string UiTextOf(dynamic element)
+    {
+        try
+        {
+            string textNoTags = null;
+            try { textNoTags = (string)element.TextNoTags; } catch { }
+            if (!string.IsNullOrWhiteSpace(textNoTags)) return textNoTags;
+
+            string text = null;
+            try { text = (string)element.Text; } catch { }
+            return text;
+        }
+        catch { return null; }
+    }
+
+    private static string NormalizeUiText(string text)
+    {
+        if (string.IsNullOrWhiteSpace(text)) return string.Empty;
+        var normalized = text.Replace('\0', ' ').Replace('\r', ' ').Replace('\n', ' ').Trim();
+
+        var chars = new List<char>(normalized.Length);
+        var insideTag = false;
+        foreach (var ch in normalized)
+        {
+            if (ch == '<')
+            {
+                insideTag = true;
+                continue;
+            }
+
+            if (ch == '>' && insideTag)
+            {
+                insideTag = false;
+                continue;
+            }
+
+            if (!insideTag)
+                chars.Add(ch);
+        }
+
+        normalized = new string(chars.ToArray()).Trim();
+        while (normalized.Contains("  "))
+            normalized = normalized.Replace("  ", " ");
+        return normalized;
+    }
+
+    private static string PathOf(dynamic entity)
+    {
+        if (entity == null) return string.Empty;
+        try { return (string)entity.Path ?? string.Empty; } catch { return string.Empty; }
+    }
+
+    private static uint IdOf(dynamic entity)
+    {
+        if (entity == null) return 0;
+        try { return Convert.ToUInt32(entity.Id); } catch { return 0; }
+    }
+
+    private static Vector3 PositionOf(dynamic entity)
+    {
+        if (entity == null) return Vector3.Zero;
+        try { return (Vector3)entity.Pos; } catch { return Vector3.Zero; }
+    }
+
+    private static bool IsVisibleElement(dynamic element)
+    {
+        if (element == null) return false;
+        try { return (bool)element.IsVisible; } catch { }
+        try { return (bool)element.IsVisibleLocal; } catch { }
+        return true;
+    }
+
+    private static Vector2 CenterOfElement(dynamic element)
+    {
+        if (element == null) return Vector2.Zero;
+
+        try
+        {
+            var rect = element.GetClientRect();
+            var center = rect.Center;
+            return new Vector2(Convert.ToSingle(center.X), Convert.ToSingle(center.Y));
+        }
+        catch
+        {
+            return Vector2.Zero;
+        }
+    }
+
+    private sealed class ArenaTransitionTarget
+    {
+        public dynamic LabelElement { get; set; }
+        public Vector2 LabelCenter { get; set; }
+        public Vector3 WorldPosition { get; set; }
+        public uint EntityId { get; set; }
+        public string Text { get; set; }
+        public string MetadataPath { get; set; }
+    }
+
     public override void EntityAdded(Entity entity)
     {
         using var __profileScope = ProfileScope("Follower.EntityAdded");

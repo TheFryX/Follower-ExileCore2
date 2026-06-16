@@ -33,6 +33,36 @@ public class GeneralSettings
     [Menu("Toggle follower hotkey")]
     public HotkeyNode ToggleFollower { get; set; } = Keys.PageUp;
 
+    [Menu("Party chat leader commands (-p stop, -s start)")]
+    public ToggleNode PartyChatLeaderCommandsEnabled { get; set; } = new ToggleNode(true);
+
+    [Menu("Party chat stop command")]
+    public TextNode PartyChatStopCommand { get; set; } = new TextNode("-p");
+
+    [Menu("Party chat start command")]
+    public TextNode PartyChatStartCommand { get; set; } = new TextNode("-s");
+
+    [Menu("Party chat command poll interval (ms)")]
+    public RangeNode<int> PartyChatCommandPollMs { get; set; } = new RangeNode<int>(1000, 1000, 5000);
+
+    [Menu("Auto-click boss Arena transition")]
+    public ToggleNode AutoClickArenaTransition { get; set; } = new ToggleNode(true);
+
+    [Menu("Arena transition label text")]
+    public TextNode ArenaTransitionLabelText { get; set; } = new TextNode("Arena");
+
+    [Menu("Arena transition metadata filter")]
+    public TextNode ArenaTransitionMetadataFilter { get; set; } = new TextNode("Metadata/MiscellaneousObjects/AreaTransition");
+
+    [Menu("Arena transition scan interval (ms)")]
+    public RangeNode<int> ArenaTransitionScanMs { get; set; } = new RangeNode<int>(1000, 750, 5000);
+
+    [Menu("Arena transition max click retries")]
+    public RangeNode<int> ArenaTransitionMaxRetries { get; set; } = new RangeNode<int>(3, 1, 10);
+
+    [Menu("Arena transition retry cooldown (ms)")]
+    public RangeNode<int> ArenaTransitionRetryCooldownMs { get; set; } = new RangeNode<int>(5000, 500, 30000);
+
     [Menu("Leader name")]
     public TextNode LeaderName { get; set; } = new TextNode("");
 
