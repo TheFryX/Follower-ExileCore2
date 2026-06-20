@@ -19,6 +19,15 @@ public class FollowerSettings : ISettings
     [Submenu(CollapsedByDefault = false)]
     public TpTradeSettings TpTrade { get; set; } = new TpTradeSettings();
 
+
+    [Menu("Party chat leader commands")]
+    [Submenu(CollapsedByDefault = true)]
+    public PartyChatLeaderCommandSettings PartyChatLeaderCommands { get; set; } = new PartyChatLeaderCommandSettings();
+
+    [Menu("Transition")]
+    [Submenu(CollapsedByDefault = true)]
+    public TransitionSettings Transition { get; set; } = new TransitionSettings();
+
     [Menu("Debug")]
     [Submenu(CollapsedByDefault = true)]
     public DebugSettings Debug { get; set; } = new DebugSettings();
@@ -33,35 +42,6 @@ public class GeneralSettings
     [Menu("Toggle follower hotkey")]
     public HotkeyNode ToggleFollower { get; set; } = Keys.PageUp;
 
-    [Menu("Party chat leader commands (-p stop, -s start)")]
-    public ToggleNode PartyChatLeaderCommandsEnabled { get; set; } = new ToggleNode(true);
-
-    [Menu("Party chat stop command")]
-    public TextNode PartyChatStopCommand { get; set; } = new TextNode("-p");
-
-    [Menu("Party chat start command")]
-    public TextNode PartyChatStartCommand { get; set; } = new TextNode("-s");
-
-    [Menu("Party chat command poll interval (ms)")]
-    public RangeNode<int> PartyChatCommandPollMs { get; set; } = new RangeNode<int>(1000, 1000, 5000);
-
-    [Menu("Auto-click boss Arena transition")]
-    public ToggleNode AutoClickArenaTransition { get; set; } = new ToggleNode(true);
-
-    [Menu("Arena transition label text")]
-    public TextNode ArenaTransitionLabelText { get; set; } = new TextNode("Arena");
-
-    [Menu("Arena transition metadata filter")]
-    public TextNode ArenaTransitionMetadataFilter { get; set; } = new TextNode("Metadata/MiscellaneousObjects/AreaTransition");
-
-    [Menu("Arena transition scan interval (ms)")]
-    public RangeNode<int> ArenaTransitionScanMs { get; set; } = new RangeNode<int>(1000, 750, 5000);
-
-    [Menu("Arena transition max click retries")]
-    public RangeNode<int> ArenaTransitionMaxRetries { get; set; } = new RangeNode<int>(3, 1, 10);
-
-    [Menu("Arena transition retry cooldown (ms)")]
-    public RangeNode<int> ArenaTransitionRetryCooldownMs { get; set; } = new RangeNode<int>(5000, 500, 30000);
 
     [Menu("Leader name")]
     public TextNode LeaderName { get; set; } = new TextNode("");
@@ -100,17 +80,77 @@ public class GeneralSettings
     public RangeNode<int> SprintRetriggerCooldownMs { get; set; } = new RangeNode<int>(5000, 500, 15000);
 }
 
+[Submenu(CollapsedByDefault = true)]
+public class PartyChatLeaderCommandSettings
+{
+    [Menu("Enabled")]
+    public ToggleNode Enabled { get; set; } = new ToggleNode(true);
+
+    [Menu("Stop command")]
+    public TextNode StopCommand { get; set; } = new TextNode("-p");
+
+    [Menu("Start command")]
+    public TextNode StartCommand { get; set; } = new TextNode("-s");
+
+    [Menu("Pause whole plugin + ESC command")]
+    public TextNode PausePluginCommand { get; set; } = new TextNode("-pp");
+
+    [Menu("Resume whole plugin + ESC command")]
+    public TextNode ResumePluginCommand { get; set; } = new TextNode("-ss");
+
+    [Menu("Dump inventory to trade command")]
+    public TextNode DumpInventoryCommand { get; set; } = new TextNode("-d");
+
+    [Menu("Command poll interval (ms)")]
+    public RangeNode<int> PollMs { get; set; } = new RangeNode<int>(1000, 1000, 5000);
+}
+
+[Submenu(CollapsedByDefault = true)]
+public class TransitionSettings
+{
+    [Menu("Auto-click boss Arena transition")]
+    public ToggleNode AutoClickArenaTransition { get; set; } = new ToggleNode(true);
+
+    [Menu("Arena transition label text")]
+    public TextNode ArenaTransitionLabelText { get; set; } = new TextNode("Arena");
+
+    [Menu("Auto-click Abyss sub-area transition")]
+    public ToggleNode AutoClickAbyssSubAreaTransition { get; set; } = new ToggleNode(true);
+
+    [Menu("Transition scan interval (ms)")]
+    public RangeNode<int> ArenaTransitionScanMs { get; set; } = new RangeNode<int>(1000, 750, 5000);
+
+    [Menu("Transition max click retries")]
+    public RangeNode<int> ArenaTransitionMaxRetries { get; set; } = new RangeNode<int>(3, 1, 10);
+
+    [Menu("Transition retry cooldown (ms)")]
+    public RangeNode<int> ArenaTransitionRetryCooldownMs { get; set; } = new RangeNode<int>(5000, 500, 30000);
+}
+
 [Submenu(CollapsedByDefault = false)]
 public class TpTradeSettings
 {
+
     [Menu("Auto accept party invites")]
     public ToggleNode AutoAcceptParty { get; set; } = new ToggleNode(true);
 
     [Menu("Auto accept trade invites")]
     public ToggleNode AutoAcceptTrade { get; set; } = new ToggleNode(false);
 
-    [Menu("Accept invites from (comma-separated)")]
-    public TextNode AcceptFrom { get; set; } = new TextNode("");
+    [Menu("Auto dump inventory to trade on leader command")]
+    public ToggleNode AutoDumpInventoryToTrade { get; set; } = new ToggleNode(true);
+
+    [Menu("Trade dump item delay (ms)")]
+    public RangeNode<int> TradeDumpItemDelayMs { get; set; } = new RangeNode<int>(45, 20, 250);
+
+    [Menu("Trade accept delay after dump (ms) - internally clamped to min 1600")]
+    public RangeNode<int> TradeDumpAcceptDelayMs { get; set; } = new RangeNode<int>(1600, 0, 6000);
+
+    [Menu("Trade window wait timeout (ms)")]
+    public RangeNode<int> TradeDumpWindowWaitTimeoutMs { get; set; } = new RangeNode<int>(10000, 1000, 60000);
+
+    [Menu("Trade finish timeout (ms)")]
+    public RangeNode<int> TradeDumpFinishTimeoutMs { get; set; } = new RangeNode<int>(60000, 5000, 180000);
 
     [Menu("Auto party poll interval (ms)")]
     public RangeNode<int> AutoPartyPollMs { get; set; } = new RangeNode<int>(500, 200, 2000);
@@ -160,6 +200,9 @@ public class DebugSettings
 
     [Menu("Spike Profiler directory")]
     public TextNode SpikeProfilerDirectory { get; set; } = new TextNode(Path.Combine(Path.GetTempPath(), "Follower-SpikeProfiler"));
+
+    [Menu("Debug TradeDump Accept click to txt")]
+    public ToggleNode DebugTradeDumpAcceptToTxt { get; set; } = new ToggleNode(false);
 
     [Menu("Debug AutoParty scanner to txt")]
     public ToggleNode DebugAutoPartyScannerToTxt { get; set; } = new ToggleNode(false);

@@ -354,7 +354,7 @@ namespace Follower
             WriteLine("================================================================================");
             WriteLine($"AutoParty scan tick #{_tickIndex} | {DateTime.Now:O}");
             WriteLine($"Area={Safe(() => _plugin.GameController.Area.CurrentArea.Name)} | PlayerAlive={Safe(() => _plugin.GameController.Player.IsAlive.ToString())}");
-            WriteLine($"AcceptParty={acceptParty} | AcceptTrade={acceptTrade} | LeaderName={Safe(() => _plugin.Settings.General.LeaderName.Value)} | AcceptFrom={Safe(() => _plugin.Settings.TpTrade.AcceptFrom.Value)}");
+            WriteLine($"AcceptParty={acceptParty} | AcceptTrade={acceptTrade} | LeaderName={Safe(() => _plugin.Settings.General.LeaderName.Value)}");
         }
 
         public void EndTick(bool clicked)

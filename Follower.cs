@@ -32,7 +32,9 @@ public class Follower : BaseSettingsPlugin<FollowerSettings>
     private AutoParty _autoParty;
     private PartyTeleport _partyTeleport;
     private PartyChatCommands _partyChatCommands;
+    private TradeInventoryDump _tradeInventoryDump;
     private bool _pausedByPartyChatCommand;
+    private bool _wholePluginPausedByPartyChatCommand;
     private SpikeProfiler _spikeProfiler;
 private Random random = new Random();
     private Camera Camera => GameController.IngameState.Camera;
@@ -41,6 +43,8 @@ private Random random = new Random();
     // Same portal detection strategy as MapChecker: detect the actual map portal entity by metadata path,
     // not by label/UI text/transition type. PoE2 hideout portals can be unreliable through EntityType/IsTargetable.
     private const string MapCheckerPortalPath = "Metadata/MiscellaneousObjects/MultiplexPortal";
+    private const string ArenaTransitionMetadataFilter = "Metadata/MiscellaneousObjects/AreaTransition";
+    private const string AbyssSubAreaTransitionMetadataPath = "Metadata/MiscellaneousObjects/Abyss/AbyssSubAreaTransition";
     private const int PortalHoverDelayMs = 80;
     private DateTime _portalHoverClickAt = DateTime.MinValue;
     private uint _portalHoverEntityId;
@@ -53,6 +57,7 @@ private Random random = new Random();
     private DateTime _arenaTransitionHoverClickAt = DateTime.MinValue;
     private uint _arenaTransitionHoverEntityId;
     private DateTime _arenaTransitionRetrySuppressedUntil = DateTime.MinValue;
+    private bool _activeArenaTransitionIsAbyssSubArea;
 
     private Vector3 _lastTargetPosition;
     private Vector3 _lastPlayerPosition;
@@ -87,6 +92,15 @@ private Random random = new Random();
 
         // Atziri entrance is inside the Vaal Ruins area.
         return area.Name.Contains("Vaal Ruins", StringComparison.OrdinalIgnoreCase);
+    }
+
+    private bool IsInAbyssSubArea()
+    {
+        var area = GameController.Area.CurrentArea;
+        if (area == null)
+            return false;
+
+        return area.Name.Contains("Abyssal Depths", StringComparison.OrdinalIgnoreCase);
     }
 
     private bool _hasUsedWP = true;
@@ -141,6 +155,7 @@ private Random random = new Random();
         _autoParty = new AutoParty(this);
         _partyTeleport = new PartyTeleport(this);
         _partyChatCommands = new PartyChatCommands(this);
+        _tradeInventoryDump = new TradeInventoryDump(this);
         _spikeProfiler = new SpikeProfiler(this);
         return base.Initialise();
     }
@@ -203,6 +218,7 @@ private Random random = new Random();
         _lastCursorMoveTarget = Vector2.Zero;
         ResetPendingArenaTransitionClick();
         _arenaTransitionRetrySuppressedUntil = DateTime.MinValue;
+        _activeArenaTransitionIsAbyssSubArea = false;
     }
 
     public override void AreaChange(AreaInstance area)
@@ -221,7 +237,8 @@ private Random random = new Random();
                  I.RenderName.Contains("Atziri's Temple", StringComparison.OrdinalIgnoreCase)) ||
                 (!string.IsNullOrEmpty(I.Path) &&
                  (I.Path.Contains("Incursion/Objects/HubTransition") ||
-                  I.Path.IndexOf(MapCheckerPortalPath, StringComparison.OrdinalIgnoreCase) >= 0)))
+                  I.Path.IndexOf(MapCheckerPortalPath, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                  I.Path.IndexOf(AbyssSubAreaTransitionMetadataPath, StringComparison.OrdinalIgnoreCase) >= 0)))
             .ToList())
         {
             if (!_areaTransitions.ContainsKey(transition.Id))
@@ -476,6 +493,69 @@ private Random random = new Random();
         catch { }
     }
 
+    internal bool IsWholePluginPausedByPartyChat => _wholePluginPausedByPartyChatCommand;
+
+    internal void SetWholePluginPausedFromPartyChat(bool paused, string leaderName, string commandText)
+    {
+        using var __profileScope = ProfileScope("Follower.PartyChatCommands.SetWholePluginPaused");
+
+        _wholePluginPausedByPartyChatCommand = paused;
+
+        if (!paused)
+        {
+            _pausedByPartyChatCommand = false;
+            if (!Settings.General.IsFollowEnabled.Value)
+                Settings.General.IsFollowEnabled.SetValueNoEvent(true);
+        }
+
+        _tasks.Clear();
+        _followTarget = null;
+        _lastTargetPosition = Vector3.Zero;
+        _lastPlayerPosition = Vector3.Zero;
+        _nextBotAction = DateTime.Now.AddMilliseconds(150);
+
+        ReleaseAllPluginInputsNow(force: true, reason: paused
+            ? "Follower.PartyChatCommands.PluginPause.ReleaseBeforeEsc"
+            : "Follower.PartyChatCommands.PluginResume.ReleaseBeforeEsc");
+
+        TapEscapeForPartyCommand(paused
+            ? "Follower.PartyChatCommands.PluginPause.Escape"
+            : "Follower.PartyChatCommands.PluginResume.Escape");
+
+        ReleaseAllPluginInputsNow(force: true, reason: paused
+            ? "Follower.PartyChatCommands.PluginPause.ReleaseAfterEsc"
+            : "Follower.PartyChatCommands.PluginResume.ReleaseAfterEsc");
+
+        try
+        {
+            LogMessage($"PartyChatCommands: leader {leaderName} sent {commandText}; whole plugin {(paused ? "paused" : "resumed")} + ESC", 3);
+        }
+        catch { }
+    }
+
+    private void TapEscapeForPartyCommand(string reason)
+    {
+        using var __profileScope = ProfileScope(reason);
+        try
+        {
+            Keyboard.KeyUp(Keys.Escape);
+            Thread.Sleep(15);
+            Keyboard.KeyDown(Keys.Escape);
+            Thread.Sleep(35);
+            Keyboard.KeyUp(Keys.Escape);
+            Thread.Sleep(25);
+        }
+        catch { }
+    }
+
+    internal void StartTradeInventoryDumpFromPartyChat(string leaderName, string commandText)
+    {
+        using var __profileScope = ProfileScope("Follower.TradeInventoryDump.StartFromPartyChat");
+        if (_wholePluginPausedByPartyChatCommand)
+            return;
+        _tradeInventoryDump?.Start(leaderName, commandText);
+    }
+
     private void QueueDodgeSprintTap(int holdMs = 25)
     {
         using var __profileScope = ProfileScope("Follower.InputScheduler.QueueDodgeSprintTap");
@@ -525,7 +605,10 @@ if (Settings.General.ToggleFollower.PressedOnce())
     var nextFollowEnabled = !Settings.General.IsFollowEnabled.Value;
     Settings.General.IsFollowEnabled.SetValueNoEvent(nextFollowEnabled);
     if (nextFollowEnabled)
+    {
         _pausedByPartyChatCommand = false;
+        _wholePluginPausedByPartyChatCommand = false;
+    }
     _tasks = new List<TaskNode>();
     ReleaseAllPluginInputsNow(force: true, reason: "Follower.Toggle.Release");
 }
@@ -540,13 +623,27 @@ var __partyChatCommandsProfileStart = _spikeProfiler?.Begin("Option.PartyChatLea
 try { _partyChatCommands?.Tick(); }
 finally { _spikeProfiler?.End("Option.PartyChatLeaderCommands", __partyChatCommandsProfileStart); }
 
+if (_wholePluginPausedByPartyChatCommand && (Settings.PartyChatLeaderCommands.Enabled?.Value ?? false))
+{
+    ReleaseAllPluginInputsNow(reason: "Follower.EarlyReturn.PartyChatWholePluginPaused.Release");
+    return;
+}
+
+var __tradeDumpProfileStart = _spikeProfiler?.Begin("Option.TradeInventoryDump") ?? 0L;
+try
+{
+    if (_tradeInventoryDump?.Tick() == true)
+        return;
+}
+finally { _spikeProfiler?.End("Option.TradeInventoryDump", __tradeDumpProfileStart); }
+
 if (!Settings.General.IsFollowEnabled.Value)
 {
     ReleaseAllPluginInputsNow(reason: "Follower.EarlyReturn.FollowDisabled.Release");
     return;
 }
 
-if (_pausedByPartyChatCommand && (Settings.General.PartyChatLeaderCommandsEnabled?.Value ?? false))
+if (_pausedByPartyChatCommand && (Settings.PartyChatLeaderCommands.Enabled?.Value ?? false))
 {
     ReleaseAllPluginInputsNow(reason: "Follower.EarlyReturn.PartyChatPaused.Release");
     return;
@@ -861,10 +958,13 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
                     {
                         _nextBotAction = DateTime.Now.AddMilliseconds(SafeBotDelayMs(2));
 
-                        var target = FindVisibleArenaTransitionLabel();
+                        var target = _activeArenaTransitionIsAbyssSubArea
+                            ? FindAbyssSubAreaTransitionEntityTarget()
+                            : FindVisibleArenaTransitionLabel();
                         if (target == null)
                         {
                             ResetPendingArenaTransitionClick();
+                            _activeArenaTransitionIsAbyssSubArea = false;
                             _tasks.RemoveAt(0);
                             break;
                         }
@@ -881,11 +981,12 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
                         }
 
                         currentTask.AttemptCount++;
-                        if (currentTask.AttemptCount > Math.Max(1, Settings.General.ArenaTransitionMaxRetries.Value * 2))
+                        if (currentTask.AttemptCount > Math.Max(1, Settings.Transition.ArenaTransitionMaxRetries.Value * 2))
                         {
                             ResetPendingArenaTransitionClick();
+                            _activeArenaTransitionIsAbyssSubArea = false;
                             _tasks.RemoveAt(0);
-                            _arenaTransitionRetrySuppressedUntil = DateTime.Now.AddMilliseconds(Math.Max(500, Settings.General.ArenaTransitionRetryCooldownMs.Value));
+                            _arenaTransitionRetrySuppressedUntil = DateTime.Now.AddMilliseconds(Math.Max(500, Settings.Transition.ArenaTransitionRetryCooldownMs.Value));
                         }
                         break;
                     }
@@ -1197,9 +1298,6 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
 
         try
         {
-            if (!(Settings.General.AutoClickArenaTransition?.Value ?? true))
-                return false;
-
             var now = DateTime.Now;
             if (now < _arenaTransitionRetrySuppressedUntil)
                 return false;
@@ -1210,22 +1308,38 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
             if (now < _nextArenaTransitionScanAt)
                 return false;
 
-            // Keep this scan intentionally slow and restricted to visible labels. Enumerating UI label collections
-            // too often can stall ExileCore2 memory reads and make following jittery.
-            _nextArenaTransitionScanAt = now.AddMilliseconds(Math.Max(750, Settings.General.ArenaTransitionScanMs.Value));
+            // Keep this scan intentionally slow. Arena uses visible labels; Abyss uses the entity metadata.
+            _nextArenaTransitionScanAt = now.AddMilliseconds(Math.Max(750, Settings.Transition.ArenaTransitionScanMs.Value));
 
-            var target = FindVisibleArenaTransitionLabel();
+            ArenaTransitionTarget target = null;
+            var transitionName = "Arena";
+            var isAbyssSubArea = false;
+
+            if (Settings.Transition.AutoClickArenaTransition?.Value ?? true)
+                target = FindVisibleArenaTransitionLabel();
+
+            // Abyss sub-area transition is handled like a local map entrance. The follower waits until
+            // the leader disappears from this area, then clicks the actual AreaTransition entity from metadata.
+            if (target == null && ShouldQueueAbyssSubAreaTransition())
+            {
+                target = FindAbyssSubAreaTransitionEntityTarget();
+                transitionName = "AbyssSubAreaTransition";
+                isAbyssSubArea = true;
+            }
+
             if (target == null)
                 return false;
 
-            // Stop normal follow/path actions while the arena label is being clicked.
+            // Stop normal follow/path actions while the transition is being clicked.
             _tasks.Clear();
             _tasks.Add(new TaskNode(
                 target.WorldPosition != Vector3.Zero ? target.WorldPosition : GameController.Player.Pos,
                 Settings.General.ClearPathDistance.Value,
                 TaskNode.TaskNodeType.ArenaTransition));
+            _activeArenaTransitionIsAbyssSubArea = isAbyssSubArea;
             ReleaseAllPluginInputsNow(force: true, reason: "Follower.ArenaTransition.Queue.ReleaseFollowMovement");
             _nextBotAction = DateTime.Now.AddMilliseconds(80);
+            try { LogMessage($"ArenaTransition: queued {transitionName} '{target.Text}' ({target.MetadataPath})", 3); } catch { }
             return true;
         }
         catch (Exception ex)
@@ -1235,15 +1349,117 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
         }
     }
 
+    private bool ShouldQueueAbyssSubAreaTransition()
+    {
+        try
+        {
+            if (!(Settings.Transition.AutoClickAbyssSubAreaTransition?.Value ?? true))
+                return false;
+
+            if (IsInAbyssSubArea())
+                return false;
+
+            if (_lastTargetPosition == Vector3.Zero)
+                return false;
+
+            // Do not pre-click while the leader is still visible. The trigger is: leader was tracked on
+            // this map, then disappeared after entering the sub-area.
+            if (_followTarget != null)
+                return false;
+
+            return true;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private ArenaTransitionTarget FindAbyssSubAreaTransitionEntityTarget()
+    {
+        using var __profileScope = ProfileScope("Follower.AbyssSubAreaTransition.FindEntityTarget");
+
+        try
+        {
+            Entity[] entities;
+            try
+            {
+                entities = GameController.EntityListWrapper?.Entities?.ToArray()
+                           ?? GameController.Entities?.ToArray()
+                           ?? Array.Empty<Entity>();
+            }
+            catch
+            {
+                return null;
+            }
+
+            var playerPos = GameController.Player.Pos;
+            var anchor = _lastTargetPosition != Vector3.Zero ? _lastTargetPosition : playerPos;
+            var maxClickDistance = Math.Max(80, Settings.General.ClearPathDistance.Value * 2);
+
+            Entity best = null;
+            float bestScore = float.MaxValue;
+
+            foreach (var entity in entities)
+            {
+                if (entity == null)
+                    continue;
+
+                if (!IsAbyssSubAreaTransitionEntity(entity))
+                    continue;
+
+                try
+                {
+                    if (entity.IsHidden)
+                        continue;
+                }
+                catch { }
+
+                var distanceFromPlayer = Vector3.Distance(playerPos, entity.Pos);
+                if (distanceFromPlayer > maxClickDistance)
+                    continue;
+
+                var distanceFromLeaderLastPos = Vector3.Distance(anchor, entity.Pos);
+                var score = distanceFromPlayer + (distanceFromLeaderLastPos * 0.35f);
+                if (score < bestScore)
+                {
+                    bestScore = score;
+                    best = entity;
+                }
+            }
+
+            if (best == null)
+                return null;
+
+            var center = WorldToValidScreenPosition(best.Pos);
+            if (center == Vector2.Zero)
+                return null;
+
+            return new ArenaTransitionTarget
+            {
+                LabelElement = null,
+                LabelCenter = center,
+                WorldPosition = best.Pos,
+                EntityId = best.Id,
+                Text = "AbyssSubAreaTransition",
+                MetadataPath = best.Path
+            };
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
     private ArenaTransitionTarget FindVisibleArenaTransitionLabel()
     {
         using var __profileScope = ProfileScope("Follower.ArenaTransition.FindVisibleLabel");
 
-        var wantedText = NormalizeUiText(Settings.General.ArenaTransitionLabelText?.Value);
+        var wantedText = NormalizeUiText(Settings.Transition.ArenaTransitionLabelText?.Value);
         if (string.IsNullOrWhiteSpace(wantedText))
             wantedText = "Arena";
 
-        var metadataFilter = Settings.General.ArenaTransitionMetadataFilter?.Value ?? string.Empty;
+        var metadataFilter = ArenaTransitionMetadataFilter;
 
         try
         {
@@ -1528,7 +1744,7 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
             }
         }
 
-        if (IsMapCheckerPortalEntity(entity))
+        if (IsMapCheckerPortalEntity(entity) || IsAbyssSubAreaTransitionEntity(entity))
         {
             if (!_areaTransitions.ContainsKey(entity.Id))
                 _areaTransitions.Add(entity.Id, entity);
@@ -1567,7 +1783,7 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
                 _areaTransitions.Remove(entity.Id);
         }
 
-        if (IsMapCheckerPortalEntity(entity))
+        if (IsMapCheckerPortalEntity(entity) || IsAbyssSubAreaTransitionEntity(entity))
         {
             if (_areaTransitions.ContainsKey(entity.Id))
                 _areaTransitions.Remove(entity.Id);
@@ -1596,6 +1812,20 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
             var path = entity?.Path;
             return !string.IsNullOrEmpty(path) &&
                    path.IndexOf(MapCheckerPortalPath, StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
+    private bool IsAbyssSubAreaTransitionEntity(Entity entity)
+    {
+        try
+        {
+            var path = entity?.Path;
+            return !string.IsNullOrEmpty(path) &&
+                   path.IndexOf(AbyssSubAreaTransitionMetadataPath, StringComparison.OrdinalIgnoreCase) >= 0;
         }
         catch
         {

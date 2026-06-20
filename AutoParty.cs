@@ -55,20 +55,10 @@ namespace Follower
             var list = new System.Collections.Generic.List<string>();
             try
             {
-                var raw = s.TpTrade.AcceptFrom?.Value;
-                if (!string.IsNullOrWhiteSpace(raw))
-                {
-                    foreach (var part in raw.Split(new[] {',',';','\n','\r','\t'}, System.StringSplitOptions.RemoveEmptyEntries))
-                    {
-                        var name = part.Trim();
-                        if (!string.IsNullOrEmpty(name)) list.Add(name);
-                    }
-                }
-                if (list.Count == 0)
-                {
-                    var leader = s.General.LeaderName?.Value;
-                    if (!string.IsNullOrWhiteSpace(leader)) list.Add(leader.Trim());
-                }
+                // Single source of truth: every module uses General -> Leader name.
+                // Auto party/trade no longer has its own invite whitelist field.
+                var leader = s.General.LeaderName?.Value;
+                if (!string.IsNullOrWhiteSpace(leader)) list.Add(leader.Trim());
             }
             catch { }
             return list;

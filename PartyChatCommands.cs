@@ -38,7 +38,7 @@ namespace Follower
                     return;
                 }
 
-                if (!(s.General.PartyChatLeaderCommandsEnabled?.Value ?? false))
+                if (!(s.PartyChatLeaderCommands.Enabled?.Value ?? false))
                 {
                     ResetScannerState();
                     return;
@@ -53,7 +53,7 @@ namespace Follower
                 // This feature runs from Render(), so it must only touch cheap counters during normal frames.
                 // It ignores the existing chat backlog while arming. This prevents a stale "-p" message from
                 // disabling follow immediately after plugin reload or after the chat UI finishes populating.
-                var pollMs = Math.Max(MinPollMs, s.General.PartyChatCommandPollMs.Value);
+                var pollMs = Math.Max(MinPollMs, s.PartyChatLeaderCommands.PollMs.Value);
                 var now = DateTime.UtcNow;
                 if ((now - _lastScan).TotalMilliseconds < pollMs)
                     return;
@@ -190,11 +190,40 @@ namespace Follower
         private void ProcessEntry(string text, string leaderName)
         {
             var s = _plugin.Settings;
+
+            if (TryParseLeaderPluginPauseCommand(
+                    text,
+                    leaderName,
+                    s.PartyChatLeaderCommands.PausePluginCommand.Value,
+                    s.PartyChatLeaderCommands.ResumePluginCommand.Value,
+                    out var pluginEnabled,
+                    out var pluginCommandText))
+            {
+                _plugin.SetWholePluginPausedFromPartyChat(!pluginEnabled, leaderName, pluginCommandText);
+                return;
+            }
+
+            // When the leader paused the whole plugin with -pp, keep only this chat-command scanner alive.
+            // Ignore -d/-p/-s until -ss arrives, so no old command is queued and executed after resume.
+            if (_plugin.IsWholePluginPausedByPartyChat)
+                return;
+
+            if ((s.TpTrade.AutoDumpInventoryToTrade?.Value ?? false) &&
+                TryParseLeaderSimpleCommand(
+                    text,
+                    leaderName,
+                    s.PartyChatLeaderCommands.DumpInventoryCommand.Value,
+                    out var dumpCommandText))
+            {
+                _plugin.StartTradeInventoryDumpFromPartyChat(leaderName, dumpCommandText);
+                return;
+            }
+
             if (TryParseLeaderCommand(
                     text,
                     leaderName,
-                    s.General.PartyChatStopCommand.Value,
-                    s.General.PartyChatStartCommand.Value,
+                    s.PartyChatLeaderCommands.StopCommand.Value,
+                    s.PartyChatLeaderCommands.StartCommand.Value,
                     out var followEnabled,
                     out var commandText))
             {
@@ -223,6 +252,40 @@ namespace Follower
             return new ChatEntry(IndexInParentOf(node, count - 1), totalMessageCount, text);
         }
 
+        private static bool TryParseLeaderPluginPauseCommand(
+            string rawText,
+            string leaderName,
+            string pauseCommand,
+            string resumeCommand,
+            out bool pluginEnabled,
+            out string commandText)
+        {
+            pluginEnabled = false;
+            commandText = string.Empty;
+
+            pauseCommand = string.IsNullOrWhiteSpace(pauseCommand) ? "-pp" : pauseCommand.Trim();
+            resumeCommand = string.IsNullOrWhiteSpace(resumeCommand) ? "-ss" : resumeCommand.Trim();
+
+            if (!TryExtractPartyLeaderMessage(rawText, leaderName, out var message))
+                return false;
+
+            if (string.Equals(message, pauseCommand, StringComparison.OrdinalIgnoreCase))
+            {
+                pluginEnabled = false;
+                commandText = pauseCommand;
+                return true;
+            }
+
+            if (string.Equals(message, resumeCommand, StringComparison.OrdinalIgnoreCase))
+            {
+                pluginEnabled = true;
+                commandText = resumeCommand;
+                return true;
+            }
+
+            return false;
+        }
+
         private static bool TryParseLeaderCommand(
             string rawText,
             string leaderName,
@@ -234,11 +297,57 @@ namespace Follower
             followEnabled = false;
             commandText = string.Empty;
 
-            if (string.IsNullOrWhiteSpace(rawText) || string.IsNullOrWhiteSpace(leaderName))
-                return false;
-
             stopCommand = string.IsNullOrWhiteSpace(stopCommand) ? "-p" : stopCommand.Trim();
             startCommand = string.IsNullOrWhiteSpace(startCommand) ? "-s" : startCommand.Trim();
+
+            if (!TryExtractPartyLeaderMessage(rawText, leaderName, out var message))
+                return false;
+
+            if (string.Equals(message, stopCommand, StringComparison.OrdinalIgnoreCase))
+            {
+                followEnabled = false;
+                commandText = stopCommand;
+                return true;
+            }
+
+            if (string.Equals(message, startCommand, StringComparison.OrdinalIgnoreCase))
+            {
+                followEnabled = true;
+                commandText = startCommand;
+                return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryParseLeaderSimpleCommand(
+            string rawText,
+            string leaderName,
+            string command,
+            out string commandText)
+        {
+            commandText = string.Empty;
+            command = string.IsNullOrWhiteSpace(command) ? "-d" : command.Trim();
+
+            if (!TryExtractPartyLeaderMessage(rawText, leaderName, out var message))
+                return false;
+
+            if (!string.Equals(message, command, StringComparison.OrdinalIgnoreCase))
+                return false;
+
+            commandText = command;
+            return true;
+        }
+
+        private static bool TryExtractPartyLeaderMessage(
+            string rawText,
+            string leaderName,
+            out string message)
+        {
+            message = string.Empty;
+
+            if (string.IsNullOrWhiteSpace(rawText) || string.IsNullOrWhiteSpace(leaderName))
+                return false;
 
             var text = NormalizeText(StripSimpleTags(rawText));
             if (string.IsNullOrWhiteSpace(text))
@@ -271,7 +380,7 @@ namespace Follower
                 }
             }
 
-            // The command is intentionally limited to party chat. Global/trade/local messages are ignored.
+            // Leader commands are intentionally limited to party chat.
             if (!isParty)
                 return false;
 
@@ -280,26 +389,10 @@ namespace Follower
                 return false;
 
             var sender = text.Substring(0, colon).Trim();
-            var message = text.Substring(colon + 1).Trim();
+            message = text.Substring(colon + 1).Trim();
 
-            if (!string.Equals(sender, leaderName, StringComparison.OrdinalIgnoreCase))
-                return false;
-
-            if (string.Equals(message, stopCommand, StringComparison.OrdinalIgnoreCase))
-            {
-                followEnabled = false;
-                commandText = stopCommand;
-                return true;
-            }
-
-            if (string.Equals(message, startCommand, StringComparison.OrdinalIgnoreCase))
-            {
-                followEnabled = true;
-                commandText = startCommand;
-                return true;
-            }
-
-            return false;
+            return string.Equals(sender, leaderName, StringComparison.OrdinalIgnoreCase) &&
+                   !string.IsNullOrWhiteSpace(message);
         }
 
         private static string TextOf(dynamic node)
