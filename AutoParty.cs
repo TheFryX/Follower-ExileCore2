@@ -16,6 +16,33 @@ namespace Follower
         private readonly AutoPartyScanDebugLogger _scanDebug;
         private DateTime _lastAttempt = DateTime.UtcNow.AddSeconds(-5);
 
+
+        private static readonly int[][] LegacyPartyToastAcceptPaths =
+        {
+            new[] { 100, 0, 0, 2, 0 },
+            new[] { 100, 0, 0, 2, 0, 0 },
+            new[] { 101, 0, 0, 2, 0 },
+            new[] { 101, 0, 0, 2, 0, 0 }
+        };
+
+        private static readonly int[][] LegacyTradeToastAcceptPaths =
+        {
+            new[] { 100, 0, 2, 0 },
+            new[] { 100, 0, 2, 0, 0 },
+            new[] { 101, 0, 2, 0 },
+            new[] { 101, 0, 2, 0, 0 }
+        };
+
+        private static readonly int[][] UpdatedToastAcceptFallbackPaths =
+        {
+            // PoE/ExileCore2 update 2026-06 moved the bottom-right invite toast from 100/101 to 102.
+            // Debug capture: IngameUi->102->1->0->2->0->0 Text="accept".
+            new[] { 102, 1, 0, 2, 0 },
+            new[] { 102, 1, 0, 2, 0, 0 }
+        };
+
+        private static readonly int[] ToastRootCandidates = { 100, 101, 102 };
+
         public AutoParty(Follower plugin) { _plugin = plugin; _scanDebug = new AutoPartyScanDebugLogger(plugin); }
 
         public void TickDebugHotkey()
@@ -241,35 +268,23 @@ namespace Follower
                 // Known PoE2 bottom-right invite toast paths captured from DevTree/F10.
                 // The top-level toast index is not stable across UI scale/resolution/session:
                 //   older dumps: IngameUi->100
-                //   latest party dump: IngameUi->101
-                // Therefore we try the cheap direct paths first for both roots, then a tiny
-                // bounded fallback on only those toast roots. No whole-IngameUi scanning.
-                if (acceptParty)
-                {
-                    if (TryClickKnownToastAcceptPath(ui, new[] { 100, 0, 0, 2, 0 }, "KnownPartyToast100"))
-                        return true;
+                //   previous update: IngameUi->101
+                //   2026-06 debug: IngameUi->102->1->0->2->0->0 Text="accept"
+                // Keep the hot path cheap: direct known paths first, then a bounded scan only
+                // inside observed toast roots. No whole-IngameUi recursive scan.
+                if (acceptParty && TryClickKnownToastAcceptPaths(ui, LegacyPartyToastAcceptPaths, "KnownPartyToast"))
+                    return true;
 
-                    if (TryClickKnownToastAcceptPath(ui, new[] { 101, 0, 0, 2, 0 }, "KnownPartyToast101"))
-                        return true;
-
-                    // Some sessions expose the clickable text leaf under the button.
-                    if (TryClickKnownToastAcceptPath(ui, new[] { 101, 0, 0, 2, 0, 0 }, "KnownPartyToast101TextLeaf"))
-                        return true;
-                }
-
-                if (acceptTrade)
-                {
-                    if (TryClickKnownToastAcceptPath(ui, new[] { 100, 0, 2, 0 }, "KnownTradeToast100"))
-                        return true;
-
-                    if (TryClickKnownToastAcceptPath(ui, new[] { 101, 0, 2, 0 }, "KnownTradeToast101"))
-                        return true;
-
-                    if (TryClickKnownToastAcceptPath(ui, new[] { 101, 0, 2, 0, 0 }, "KnownTradeToast101TextLeaf"))
-                        return true;
-                }
+                if (acceptTrade && TryClickKnownToastAcceptPaths(ui, LegacyTradeToastAcceptPaths, "KnownTradeToast"))
+                    return true;
 
                 if (TryAcceptFromKnownToastRoots(ui, acceptParty, acceptTrade))
+                    return true;
+
+                // Last-resort compatibility path for the latest captured toast layout. This is
+                // intentionally after the validated scan, because the updated toast can be reused
+                // for party and trade and its invitation text may be absent from hover-only dumps.
+                if ((acceptParty || acceptTrade) && TryClickKnownToastAcceptPaths(ui, UpdatedToastAcceptFallbackPaths, "KnownUpdatedToast102"))
                     return true;
 
                 return false;
@@ -287,12 +302,25 @@ namespace Follower
             if (ui == null) return false;
 
             // Keep this deliberately tiny. These are the only roots observed for the bottom-right toast.
-            int[] roots = { 100, 101 };
-            for (int i = 0; i < roots.Length; i++)
+            for (int i = 0; i < ToastRootCandidates.Length; i++)
             {
-                int rootIndex = roots[i];
+                int rootIndex = ToastRootCandidates[i];
                 dynamic toastRoot = GetChild(ui, rootIndex);
                 if (toastRoot != null && TryAcceptFromToastRoot(toastRoot, "IngameUi->" + rootIndex, acceptParty, acceptTrade))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private bool TryClickKnownToastAcceptPaths(dynamic ui, int[][] paths, string sourcePrefix)
+        {
+            using var __profileScope = _plugin.ProfileScope("AutoParty.TryClickKnownToastAcceptPaths." + sourcePrefix);
+            if (ui == null || paths == null) return false;
+
+            for (int i = 0; i < paths.Length; i++)
+            {
+                if (TryClickKnownToastAcceptPath(ui, paths[i], sourcePrefix + "#" + i.ToString(System.Globalization.CultureInfo.InvariantCulture)))
                     return true;
             }
 
@@ -306,6 +334,12 @@ namespace Follower
             if (node == null || !IsVisible(node))
             {
                 _scanDebug.Event(source, "known path not visible path=" + FormatPath(path));
+                return false;
+            }
+
+            if (!LooksLikeAcceptButton(node))
+            {
+                _scanDebug.Event(source, "known path visible but not an accept button path=" + FormatPath(path) + " text=" + NormalizeText(TextOf(node)));
                 return false;
             }
 
@@ -378,23 +412,23 @@ namespace Follower
                 if (LooksLikePlayerName(clean))
                     state.AnyPlayerLikeTextSeen = true;
 
-                if (clean.IndexOf("sent you a party invite", StringComparison.OrdinalIgnoreCase) >= 0)
+                if (ContainsPartyInviteText(clean))
                 {
                     state.PartyInviteFound = true;
                     _scanDebug.Reaction("DirectToast", "PARTY_INVITE", path, node, clean, "");
                 }
 
-                if (clean.IndexOf("sent you a trade request", StringComparison.OrdinalIgnoreCase) >= 0)
+                if (ContainsTradeRequestText(clean))
                 {
                     state.TradeRequestFound = true;
                     _scanDebug.Reaction("DirectToast", "TRADE_REQUEST", path, node, clean, "");
                 }
 
-                if (state.AcceptNode == null && clean.Equals("accept", StringComparison.OrdinalIgnoreCase))
+                if (state.AcceptNode == null && LooksLikeAcceptButton(node))
                 {
                     state.AcceptNode = node;
                     state.AcceptPath = path;
-                    _scanDebug.Reaction("DirectToast", "ACCEPT_NODE", path, node, clean, "captured path from F10 debug pattern");
+                    _scanDebug.Reaction("DirectToast", "ACCEPT_NODE", path, node, clean, "captured visible accept button");
                 }
             }
 
@@ -417,11 +451,23 @@ namespace Follower
             using var __profileScope = _plugin.ProfileScope("AutoParty.ClickNode");
             try
             {
-                var r = node.GetClientRect();
-                var center = new Vector2(r.Center.X, r.Center.Y);
+                Vector2 center;
+                if (!TryGetClickableCenter(node, out center))
+                {
+                    _scanDebug.Event(source, "CLICK skipped invalid rect path=" + path);
+                    return false;
+                }
+
                 _plugin.PrepareForPluginMouseAction("AutoParty.ClickNode.Prepare");
-                Mouse.SetCursorPosAndLeftClick(center, 0);
-                _plugin.CompletePluginMouseAction("AutoParty.ClickNode.Complete");
+                try
+                {
+                    Mouse.SetCursorPosAndLeftClick(center, 0);
+                }
+                finally
+                {
+                    _plugin.CompletePluginMouseAction("AutoParty.ClickNode.Complete");
+                }
+
                 _plugin.LogMessage("AutoParty: accepted invite (" + source + ").", 1);
                 _scanDebug.Event(source, "CLICK accept path=" + path + " center=" + center);
                 _scanDebug.Reaction(source, "CLICK_ACCEPT", path, node, TextOf(node), "center=" + center);
@@ -434,12 +480,79 @@ namespace Follower
             }
         }
 
+
+
+        private static bool ContainsPartyInviteText(string clean)
+        {
+            if (string.IsNullOrEmpty(clean)) return false;
+            return clean.IndexOf("sent you a party invite", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   clean.IndexOf("party invite", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   clean.IndexOf("invited you to party", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   clean.IndexOf("invited you to a party", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool ContainsTradeRequestText(string clean)
+        {
+            if (string.IsNullOrEmpty(clean)) return false;
+            return clean.IndexOf("sent you a trade request", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   clean.IndexOf("trade request", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   clean.IndexOf("wants to trade", StringComparison.OrdinalIgnoreCase) >= 0 ||
+                   clean.IndexOf("trade invite", StringComparison.OrdinalIgnoreCase) >= 0;
+        }
+
+        private static bool LooksLikeAcceptButton(dynamic node)
+        {
+            string clean = NormalizeText(TextOf(node));
+            if (clean.Equals("accept", StringComparison.OrdinalIgnoreCase)) return true;
+
+            // When ExileCore exposes the button container instead of the text leaf, the container
+            // can have no text while its first child contains TextNoTags="accept".
+            dynamic children = GetChildren(node);
+            int count = GetCount(children);
+            int take = Math.Min(count, 4);
+            for (int i = 0; i < take; i++)
+            {
+                dynamic child = null;
+                try { child = children[i]; } catch { }
+                if (child == null || !IsVisible(child)) continue;
+                string childText = NormalizeText(TextOf(child));
+                if (childText.Equals("accept", StringComparison.OrdinalIgnoreCase)) return true;
+            }
+
+            return false;
+        }
+
+        private static bool TryGetClickableCenter(dynamic node, out Vector2 center)
+        {
+            center = Vector2.Zero;
+            if (node == null || !IsVisible(node)) return false;
+
+            try
+            {
+                var r = node.GetClientRect();
+                float width = Convert.ToSingle(r.Width, System.Globalization.CultureInfo.InvariantCulture);
+                float height = Convert.ToSingle(r.Height, System.Globalization.CultureInfo.InvariantCulture);
+                if (width <= 0f || height <= 0f) return false;
+
+                float x = Convert.ToSingle(r.Center.X, System.Globalization.CultureInfo.InvariantCulture);
+                float y = Convert.ToSingle(r.Center.Y, System.Globalization.CultureInfo.InvariantCulture);
+                if (float.IsNaN(x) || float.IsNaN(y) || float.IsInfinity(x) || float.IsInfinity(y)) return false;
+
+                center = new Vector2(x, y);
+                return true;
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
         private bool FindAndClickSocialAccept(bool acceptParty, bool acceptTrade)
         {
             using var __profileScope = _plugin.ProfileScope("AutoParty.FindAndClickSocialAccept.Disabled");
             // Intentionally disabled for performance. The old implementation recursively scanned
             // the whole IngameUi/Social/Chat tree and caused heavy CPU load. Current invite toast
-            // was captured under IngameUi->100/101 and is handled by FindAndClickPopupAccept().
+            // is handled through bounded known toast roots in FindAndClickPopupAccept().
             return false;
         }
 
