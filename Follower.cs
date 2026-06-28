@@ -1,7 +1,8 @@
-using RectangleF = ExileCore2.Shared.RectangleF;
+﻿using RectangleF = ExileCore2.Shared.RectangleF;
 using FollowerInternals;
 using ExileCore2.Shared.Nodes;
 using ExileCore2.Shared.Interfaces;
+using ImGuiNET;
 using System.Numerics;
 using ExileCore2;
 using ExileCore2.PoEMemory.Components;
@@ -33,6 +34,7 @@ public class Follower : BaseSettingsPlugin<FollowerSettings>
     private PartyTeleport _partyTeleport;
     private PartyChatCommands _partyChatCommands;
     private TradeInventoryDump _tradeInventoryDump;
+    private FollowerPickUpManager _pickUpManager;
     private bool _pausedByPartyChatCommand;
     private bool _wholePluginPausedByPartyChatCommand;
     private SpikeProfiler _spikeProfiler;
@@ -156,8 +158,57 @@ private Random random = new Random();
         _partyTeleport = new PartyTeleport(this);
         _partyChatCommands = new PartyChatCommands(this);
         _tradeInventoryDump = new TradeInventoryDump(this);
+        _pickUpManager = new FollowerPickUpManager(this);
         _spikeProfiler = new SpikeProfiler(this);
         return base.Initialise();
+    }
+
+    public override void DrawSettings()
+    {
+        base.DrawSettings();
+        DrawTradeDumpIgnoredCellsSettings();
+
+        // DrawSettings can be opened before the plugin has been initialized/enabled.
+        // Create the PickUp settings renderer lazily so the rule table is visible on a clean install too.
+        _pickUpManager ??= new FollowerPickUpManager(this);
+        _pickUpManager.DrawSettings();
+    }
+
+    private void DrawTradeDumpIgnoredCellsSettings()
+    {
+        Settings.TpTrade.TradeDumpIgnoredCells = InventoryGridIgnoreHelper.Normalize(Settings.TpTrade.TradeDumpIgnoredCells);
+        var ignoredCells = Settings.TpTrade.TradeDumpIgnoredCells;
+
+        ImGui.Spacing();
+        if (!ImGui.CollapsingHeader("TP / Trade - Dump ignored inventory slots"))
+            return;
+
+        ImGui.Text("Ignored Inventory Slots (checked = not dumped)");
+        ImGui.TextDisabled("The dump command skips items whose top-left inventory cell is checked.");
+
+        if (ImGui.Button("Clear dump ignored slots"))
+        {
+            Settings.TpTrade.TradeDumpIgnoredCells = new bool[InventoryGridIgnoreHelper.Rows, InventoryGridIgnoreHelper.Columns];
+            ignoredCells = Settings.TpTrade.TradeDumpIgnoredCells;
+        }
+
+        ImGui.BeginChild("##FollowerTradeDumpIgnoredCellsMain", new Vector2(ImGui.GetContentRegionAvail().X, 204f), ImGuiChildFlags.Border,
+            ImGuiWindowFlags.NoScrollWithMouse);
+
+        for (var y = 0; y < InventoryGridIgnoreHelper.Rows; y++)
+        {
+            for (var x = 0; x < InventoryGridIgnoreHelper.Columns; x++)
+            {
+                var isCellIgnored = ignoredCells[y, x];
+                if (ImGui.Checkbox($"##FollowerTradeDumpIgnoredCell_{y}_{x}", ref isCellIgnored))
+                    ignoredCells[y, x] = isCellIgnored;
+
+                if (x < InventoryGridIgnoreHelper.Columns - 1)
+                    ImGui.SameLine();
+            }
+        }
+
+        ImGui.EndChild();
     }
 
 
@@ -225,6 +276,7 @@ private Random random = new Random();
     {
         using var __profileScope = ProfileScope("Follower.AreaChange.Total");
         ResetPathing();
+        _pickUpManager?.Reset("AreaChange");
 
         //Load initial transitions!
 
@@ -465,6 +517,14 @@ private Random random = new Random();
         _nextForcedInputReleaseAt = DateTime.Now.AddMilliseconds(85);
     }
 
+    internal bool TryMoveCursorForAutomation(Vector2 screenPos) => TryMoveCursorForMovement(screenPos);
+
+    internal void QueueMovementKeyTapForAutomation(int minHoldMs = 30, int randomExtraMs = 25) => QueueMovementKeyTap(minHoldMs, randomExtraMs);
+
+    internal Vector2 WorldToValidScreenPositionForAutomation(Vector3 worldPos) => WorldToValidScreenPosition(worldPos);
+
+    internal void DrawAutomationFrame(RectangleF rect, System.Drawing.Color color, int thickness) => Graphics.DrawFrame(rect, color, thickness);
+
     internal void SetFollowEnabledFromPartyChat(bool enabled, string leaderName, string commandText)
     {
         using var __profileScope = ProfileScope("Follower.PartyChatCommands.SetFollowEnabled");
@@ -478,6 +538,7 @@ private Random random = new Random();
             Settings.General.IsFollowEnabled.SetValueNoEvent(true);
 
         _tasks.Clear();
+        _pickUpManager?.Reset("PartyChatCommand");
         _followTarget = null;
         _lastTargetPosition = Vector3.Zero;
         _lastPlayerPosition = Vector3.Zero;
@@ -509,6 +570,7 @@ private Random random = new Random();
         }
 
         _tasks.Clear();
+        _pickUpManager?.Reset("PartyChatWholePluginCommand");
         _followTarget = null;
         _lastTargetPosition = Vector3.Zero;
         _lastPlayerPosition = Vector3.Zero;
@@ -610,6 +672,7 @@ if (Settings.General.ToggleFollower.PressedOnce())
         _wholePluginPausedByPartyChatCommand = false;
     }
     _tasks = new List<TaskNode>();
+    _pickUpManager?.Reset("Toggle");
     ReleaseAllPluginInputsNow(force: true, reason: "Follower.Toggle.Release");
 }
 }
@@ -668,6 +731,14 @@ finally { _spikeProfiler?.End("Option.AutoAcceptParty/AutoAcceptTrade", __autoPa
 var __partyTeleportProfileStart = _spikeProfiler?.Begin("Option.TeleportToLeader") ?? 0L;
 try { _partyTeleport?.Tick(); }
 finally { _spikeProfiler?.End("Option.TeleportToLeader", __partyTeleportProfileStart); }
+
+var __pickUpProfileStart = _spikeProfiler?.Begin("Option.PickUp") ?? 0L;
+try
+{
+    if (_pickUpManager?.Tick() == true)
+        return;
+}
+finally { _spikeProfiler?.End("Option.PickUp", __pickUpProfileStart); }
 
 //Cache the current follow target (if present)
         var __targetPlanningProfileStart = _spikeProfiler?.Begin("Option.LeaderName/Pathfinding/CloseFollow/QuestLoot") ?? 0L;

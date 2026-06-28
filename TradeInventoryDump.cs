@@ -34,6 +34,7 @@ namespace Follower
         private DumpState _state = DumpState.Idle;
         private ClickPhase _clickPhase = ClickPhase.None;
         private List<ServerInventory.InventSlotItem> _items = new List<ServerInventory.InventSlotItem>();
+        private int _ignoredItemsSkippedInSnapshot;
         private int _itemIndex;
         private DateTime _nextActionAt = DateTime.MinValue;
         private DateTime _startedAt = DateTime.MinValue;
@@ -83,6 +84,7 @@ namespace Follower
                 _finishDeadline = DateTime.MinValue;
                 _nextFinishChatScanAt = DateTime.MinValue;
                 _itemIndex = 0;
+                _ignoredItemsSkippedInSnapshot = 0;
                 _items.Clear();
                 _clickPhase = ClickPhase.None;
                 _acceptAttempts = 0;
@@ -191,13 +193,19 @@ namespace Follower
 
             if (_items.Count == 0)
             {
-                _plugin.LogMessage("TradeDump: inventory is empty; clicking trade accept.", 3);
+                var noDumpableItemsMessage = _ignoredItemsSkippedInSnapshot > 0
+                    ? $"TradeDump: no dumpable inventory items; skipped {_ignoredItemsSkippedInSnapshot} ignored item(s); clicking trade accept."
+                    : "TradeDump: inventory is empty; clicking trade accept.";
+                _plugin.LogMessage(noDumpableItemsMessage, 3);
                 _state = DumpState.WaitBeforeAccept;
                 _nextActionAt = now.AddMilliseconds(GetAcceptDelayAfterDumpMs());
                 return true;
             }
 
-            _plugin.LogMessage($"TradeDump: dumping {_items.Count} inventory item(s) to trade.", 3);
+            var dumpMessage = _ignoredItemsSkippedInSnapshot > 0
+                ? $"TradeDump: dumping {_items.Count} inventory item(s) to trade; skipped {_ignoredItemsSkippedInSnapshot} ignored item(s)."
+                : $"TradeDump: dumping {_items.Count} inventory item(s) to trade.";
+            _plugin.LogMessage(dumpMessage, 3);
             _state = DumpState.DumpingItems;
             _nextActionAt = now;
             return true;
@@ -386,14 +394,36 @@ namespace Follower
 
         private List<ServerInventory.InventSlotItem> GetInventoryItemsSnapshot()
         {
+            _ignoredItemsSkippedInSnapshot = 0;
+
             try
             {
-                return _plugin.GameController.IngameState.ServerData.PlayerInventories[0]
+                _plugin.Settings.TpTrade.TradeDumpIgnoredCells = InventoryGridIgnoreHelper.Normalize(_plugin.Settings.TpTrade.TradeDumpIgnoredCells);
+                var ignoredCells = _plugin.Settings.TpTrade.TradeDumpIgnoredCells;
+
+                var inventoryItems = _plugin.GameController.IngameState.ServerData.PlayerInventories[0]
                     .Inventory.InventorySlotItems
                     .Where(x => x.Item != null)
                     .OrderBy(x => x.PosY)
                     .ThenBy(x => x.PosX)
                     .ToList();
+
+                if (InventoryGridIgnoreHelper.CountIgnoredCells(ignoredCells) == 0)
+                    return inventoryItems;
+
+                var dumpableItems = new List<ServerInventory.InventSlotItem>(inventoryItems.Count);
+                foreach (var item in inventoryItems)
+                {
+                    if (InventoryGridIgnoreHelper.IsIgnored(item, ignoredCells))
+                    {
+                        _ignoredItemsSkippedInSnapshot++;
+                        continue;
+                    }
+
+                    dumpableItems.Add(item);
+                }
+
+                return dumpableItems;
             }
             catch (Exception ex)
             {
@@ -1050,6 +1080,7 @@ namespace Follower
             _clickPhase = ClickPhase.None;
             _items.Clear();
             _itemIndex = 0;
+            _ignoredItemsSkippedInSnapshot = 0;
             _nextActionAt = DateTime.MinValue;
             _startedAt = DateTime.MinValue;
             _finishDeadline = DateTime.MinValue;
