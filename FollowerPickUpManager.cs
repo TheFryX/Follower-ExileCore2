@@ -365,7 +365,7 @@ internal sealed class FollowerPickUpManager
 
         _nextScanAt = now.AddMilliseconds(FixedScanIntervalMs);
 
-        if (_compiledRules.Count == 0)
+        if (!IsPickUpEverythingEnabled() && _compiledRules.Count == 0)
             return false;
 
         if (!CanStartPickupNearLeader())
@@ -765,7 +765,8 @@ internal sealed class FollowerPickUpManager
                 return null;
 
             var itemData = new ItemData(itemEntity, groundEntity, _plugin.GameController);
-            if (!MatchesRules(itemData, itemEntity, labelElement, out var ruleName))
+            var ruleName = "PickUp Everything";
+            if (!IsPickUpEverythingEnabled() && !MatchesRules(itemData, itemEntity, labelElement, out ruleName))
                 return null;
 
             if (!CanFitInventory(itemData))
@@ -789,6 +790,19 @@ internal sealed class FollowerPickUpManager
             return null;
         }
     }
+
+    private bool IsPickUpEverythingEnabled()
+    {
+        try
+        {
+            return _plugin.Settings.PickUp.PickUpEverything?.Value ?? false;
+        }
+        catch
+        {
+            return false;
+        }
+    }
+
 
     private bool MatchesRules(ItemData itemData, Entity itemEntity, object labelElement, out string ruleName)
     {

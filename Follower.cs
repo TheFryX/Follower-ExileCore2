@@ -556,6 +556,25 @@ private Random random = new Random();
 
     internal bool IsWholePluginPausedByPartyChat => _wholePluginPausedByPartyChatCommand;
 
+    internal void SetPickUpEnabledFromPartyChat(bool enabled, string leaderName, string commandText)
+    {
+        using var __profileScope = ProfileScope("Follower.PartyChatCommands.SetPickUpEnabled");
+
+        if (Settings?.PickUp?.Enabled == null)
+            return;
+
+        if (Settings.PickUp.Enabled.Value != enabled)
+            Settings.PickUp.Enabled.SetValueNoEvent(enabled);
+
+        _pickUpManager?.Reset(enabled ? "PartyChatPickUpStart" : "PartyChatPickUpPause");
+
+        try
+        {
+            LogMessage($"PartyChatCommands: leader {leaderName} sent {commandText}; PickUp {(enabled ? "started" : "paused")}", 3);
+        }
+        catch { }
+    }
+
     internal void SetWholePluginPausedFromPartyChat(bool paused, string leaderName, string commandText)
     {
         using var __profileScope = ProfileScope("Follower.PartyChatCommands.SetWholePluginPaused");

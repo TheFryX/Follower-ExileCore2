@@ -108,6 +108,12 @@ public class PartyChatLeaderCommandSettings
     [Menu("Dump inventory to trade command")]
     public TextNode DumpInventoryCommand { get; set; } = new TextNode("-d");
 
+    [Menu("Start PickUp command")]
+    public TextNode StartPickUpCommand { get; set; } = new TextNode("-l");
+
+    [Menu("Pause PickUp command")]
+    public TextNode PausePickUpCommand { get; set; } = new TextNode("-ls");
+
     [Menu("Command poll interval (ms)")]
     public RangeNode<int> PollMs { get; set; } = new RangeNode<int>(1000, 1000, 5000);
 }
@@ -197,11 +203,9 @@ public class PickUpSettings
     [Menu("Enabled")]
     public ToggleNode Enabled { get; set; } = new ToggleNode(false);
 
-    [IgnoreMenu]
+    [Menu("PickUp Everything", "Pick up every visible clickable ground item within range, ignoring the rule table. Still respects item allocation.")]
     public ToggleNode PickUpEverything { get; set; } = new ToggleNode(false);
 
-    [IgnoreMenu]
-    public ToggleNode PickUpWhenInventoryIsFull { get; set; } = new ToggleNode(false);
 
     [IgnoreMenu]
     public ToggleNode RespectItemAllocation { get; set; } = new ToggleNode(true);

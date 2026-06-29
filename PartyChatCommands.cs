@@ -204,7 +204,7 @@ namespace Follower
             }
 
             // When the leader paused the whole plugin with -pp, keep only this chat-command scanner alive.
-            // Ignore -d/-p/-s until -ss arrives, so no old command is queued and executed after resume.
+            // Ignore -d/-l/-ls/-p/-s until -ss arrives, so no old command is queued and executed after resume.
             if (_plugin.IsWholePluginPausedByPartyChat)
                 return;
 
@@ -216,6 +216,18 @@ namespace Follower
                     out var dumpCommandText))
             {
                 _plugin.StartTradeInventoryDumpFromPartyChat(leaderName, dumpCommandText);
+                return;
+            }
+
+            if (TryParseLeaderPickUpCommand(
+                    text,
+                    leaderName,
+                    s.PartyChatLeaderCommands.PausePickUpCommand.Value,
+                    s.PartyChatLeaderCommands.StartPickUpCommand.Value,
+                    out var pickUpEnabled,
+                    out var pickUpCommandText))
+            {
+                _plugin.SetPickUpEnabledFromPartyChat(pickUpEnabled, leaderName, pickUpCommandText);
                 return;
             }
 
@@ -260,30 +272,15 @@ namespace Follower
             out bool pluginEnabled,
             out string commandText)
         {
-            pluginEnabled = false;
-            commandText = string.Empty;
-
-            pauseCommand = string.IsNullOrWhiteSpace(pauseCommand) ? "-pp" : pauseCommand.Trim();
-            resumeCommand = string.IsNullOrWhiteSpace(resumeCommand) ? "-ss" : resumeCommand.Trim();
-
-            if (!TryExtractPartyLeaderMessage(rawText, leaderName, out var message))
-                return false;
-
-            if (string.Equals(message, pauseCommand, StringComparison.OrdinalIgnoreCase))
-            {
-                pluginEnabled = false;
-                commandText = pauseCommand;
-                return true;
-            }
-
-            if (string.Equals(message, resumeCommand, StringComparison.OrdinalIgnoreCase))
-            {
-                pluginEnabled = true;
-                commandText = resumeCommand;
-                return true;
-            }
-
-            return false;
+            return TryParseLeaderToggleCommand(
+                rawText,
+                leaderName,
+                pauseCommand,
+                resumeCommand,
+                "-pp",
+                "-ss",
+                out pluginEnabled,
+                out commandText);
         }
 
         private static bool TryParseLeaderCommand(
@@ -294,30 +291,75 @@ namespace Follower
             out bool followEnabled,
             out string commandText)
         {
-            followEnabled = false;
+            return TryParseLeaderToggleCommand(
+                rawText,
+                leaderName,
+                stopCommand,
+                startCommand,
+                "-p",
+                "-s",
+                out followEnabled,
+                out commandText);
+        }
+
+        private static bool TryParseLeaderPickUpCommand(
+            string rawText,
+            string leaderName,
+            string pauseCommand,
+            string startCommand,
+            out bool pickUpEnabled,
+            out string commandText)
+        {
+            return TryParseLeaderToggleCommand(
+                rawText,
+                leaderName,
+                pauseCommand,
+                startCommand,
+                "-ls",
+                "-l",
+                out pickUpEnabled,
+                out commandText);
+        }
+
+        private static bool TryParseLeaderToggleCommand(
+            string rawText,
+            string leaderName,
+            string disableCommand,
+            string enableCommand,
+            string defaultDisableCommand,
+            string defaultEnableCommand,
+            out bool enabled,
+            out string commandText)
+        {
+            enabled = false;
             commandText = string.Empty;
 
-            stopCommand = string.IsNullOrWhiteSpace(stopCommand) ? "-p" : stopCommand.Trim();
-            startCommand = string.IsNullOrWhiteSpace(startCommand) ? "-s" : startCommand.Trim();
+            disableCommand = NormalizeCommandOrDefault(disableCommand, defaultDisableCommand);
+            enableCommand = NormalizeCommandOrDefault(enableCommand, defaultEnableCommand);
 
             if (!TryExtractPartyLeaderMessage(rawText, leaderName, out var message))
                 return false;
 
-            if (string.Equals(message, stopCommand, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(message, disableCommand, StringComparison.OrdinalIgnoreCase))
             {
-                followEnabled = false;
-                commandText = stopCommand;
+                enabled = false;
+                commandText = disableCommand;
                 return true;
             }
 
-            if (string.Equals(message, startCommand, StringComparison.OrdinalIgnoreCase))
+            if (string.Equals(message, enableCommand, StringComparison.OrdinalIgnoreCase))
             {
-                followEnabled = true;
-                commandText = startCommand;
+                enabled = true;
+                commandText = enableCommand;
                 return true;
             }
 
             return false;
+        }
+
+        private static string NormalizeCommandOrDefault(string command, string defaultCommand)
+        {
+            return string.IsNullOrWhiteSpace(command) ? defaultCommand : command.Trim();
         }
 
         private static bool TryParseLeaderSimpleCommand(

@@ -23,8 +23,7 @@ namespace FollowerInternals
             return from + (to - from) * s;
         }
 
-        // Placeholders: if original code used GridToWorld/WorldToGrid, keep identity mapping
-        // You can wire these to ExileCore2 terrain utils later if needed.
+        // Identity mapping used by legacy grid/world helpers when no terrain conversion service is available.
         public static Vector2 WorldToGrid(Vector3 world) => new Vector2(world.X, world.Y);
         public static Vector3 GridToWorld(Vector2 grid, float z = 0f) => new Vector3(grid.X, grid.Y, z);
     }
