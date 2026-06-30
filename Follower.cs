@@ -1,4 +1,4 @@
-﻿using RectangleF = ExileCore2.Shared.RectangleF;
+using RectangleF = ExileCore2.Shared.RectangleF;
 using FollowerInternals;
 using ExileCore2.Shared.Nodes;
 using ExileCore2.Shared.Interfaces;
@@ -42,12 +42,15 @@ private Random random = new Random();
     private Camera Camera => GameController.IngameState.Camera;
     private Dictionary<uint, Entity> _areaTransitions = new Dictionary<uint, Entity>();
 
-    // Same portal detection strategy as MapChecker: detect the actual map portal entity by metadata path,
-    // not by label/UI text/transition type. PoE2 hideout portals can be unreliable through EntityType/IsTargetable.
+    // Hideout map portals are most reliable through visible ground labels. MTX portals expose their
+    // clickable labels with metadata below; EntityType/IsTargetable are not consistent across skins.
     private const string MapCheckerPortalPath = "Metadata/MiscellaneousObjects/MultiplexPortal";
+    private const string TownPortalMtxMetadataPrefix = "Metadata/Effects/Microtransactions/Town_Portals/";
+    private const string HideoutPortalMetadataPrefix = "Metadata/MiscellaneousObjects/Portals/";
     private const string ArenaTransitionMetadataFilter = "Metadata/MiscellaneousObjects/AreaTransition";
     private const string AbyssSubAreaTransitionMetadataPath = "Metadata/MiscellaneousObjects/Abyss/AbyssSubAreaTransition";
     private const int PortalHoverDelayMs = 80;
+    private const int PortalLabelScanMaxVisibleLabels = 96;
     private DateTime _portalHoverClickAt = DateTime.MinValue;
     private uint _portalHoverEntityId;
 
@@ -267,6 +270,7 @@ private Random random = new Random();
         _nextMovementKeyTapAt = DateTime.Now.AddMilliseconds(MIN_MOVEMENT_KEY_TAP_GAP_MS);
         _nextCursorMoveAt = DateTime.MinValue;
         _lastCursorMoveTarget = Vector2.Zero;
+        ResetPendingPortalClick();
         ResetPendingArenaTransitionClick();
         _arenaTransitionRetrySuppressedUntil = DateTime.MinValue;
         _activeArenaTransitionIsAbyssSubArea = false;
@@ -289,7 +293,7 @@ private Random random = new Random();
                  I.RenderName.Contains("Atziri's Temple", StringComparison.OrdinalIgnoreCase)) ||
                 (!string.IsNullOrEmpty(I.Path) &&
                  (I.Path.Contains("Incursion/Objects/HubTransition") ||
-                  I.Path.IndexOf(MapCheckerPortalPath, StringComparison.OrdinalIgnoreCase) >= 0 ||
+                  IsMapCheckerPortalEntity(I) ||
                   I.Path.IndexOf(AbyssSubAreaTransitionMetadataPath, StringComparison.OrdinalIgnoreCase) >= 0)))
             .ToList())
         {
@@ -848,14 +852,18 @@ finally { _spikeProfiler?.End("Option.PickUp", __pickUpProfileStart); }
         {
 
             
-            // MapChecker-style portal priority: when the leader disappears from the hideout after entering a map,
-            // click the real MultiplexPortal entity directly. This avoids choosing a random transition near the
-            // leader's last position and prevents followers from running around the hideout looking for it.
-            var directPortal = FindNearestMapCheckerPortal(requireTargetable: false);
-            if (directPortal != null)
+            // Preferred path: use the visible portal label and its metadata, because MTX portals often do
+            // not expose stable Portal/TownPortal entity types. Fall back to entity metadata for older builds.
+            var directPortalLabel = IsInHideout() ? FindNearestVisibleHideoutPortalLabel() : null;
+            var directPortal = directPortalLabel == null ? FindNearestMapCheckerPortal(requireTargetable: false) : null;
+            if (directPortalLabel != null || directPortal != null)
             {
+                var portalPosition = directPortalLabel?.WorldPosition ?? directPortal.Pos;
+                if (portalPosition == Vector3.Zero)
+                    portalPosition = GameController.Player.Pos;
+
                 _tasks.Clear();
-                _tasks.Add(new TaskNode(directPortal.Pos,
+                _tasks.Add(new TaskNode(portalPosition,
                     Settings.General.PathfindingNodeDistance.Value,
                     TaskNode.TaskNodeType.Transition));
             }
@@ -985,27 +993,39 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
                     {
                         _nextBotAction = DateTime.Now.AddMilliseconds(SafeBotDelayMs(2));
 
-                        // Re-resolve the portal every tick by metadata path, like MapChecker does. Do not rely on a
-                        // stale TaskNode/world position if the portal entity shifts/refreshes after the leader enters.
-                        var portal = (IsInHideout() || IsInAtziriEntranceArea())
-                            ? FindNearestMapCheckerPortal(requireTargetable: false)
-                            : null;
-                        var targetWorld = portal?.Pos ?? currentTask.WorldPosition;
+                        // Re-resolve the portal every tick. Visible UI labels are preferred; entity metadata is
+                        // the compatibility fallback for non-MTX/older ExileCore2 builds.
+                        var portalTarget = IsInHideout()
+                            ? ResolveBestHideoutPortalTarget()
+                            : IsInAtziriEntranceArea()
+                                ? ToPortalTarget(FindNearestMapCheckerPortal(requireTargetable: false))
+                                : null;
+
+                        var targetWorld = portalTarget?.WorldPosition ?? currentTask.WorldPosition;
+                        if (targetWorld == Vector3.Zero)
+                            targetWorld = GameController.Player.Pos;
+
                         currentTask.WorldPosition = targetWorld;
                         taskDistance = Vector3.Distance(GameController.Player.Pos, targetWorld);
 
-                        var __transitionScreenProfileStart = ProfileBegin("Follower.Task.Transition.WorldToScreen");
                         Vector2 screenPos;
-                        try { screenPos = WorldToValidScreenPosition(targetWorld); }
-                        finally { ProfileEnd("Follower.Task.Transition.WorldToScreen", __transitionScreenProfileStart); }
+                        if (portalTarget != null && portalTarget.ClickPosition != Vector2.Zero)
+                        {
+                            screenPos = portalTarget.ClickPosition;
+                        }
+                        else
+                        {
+                            var __transitionScreenProfileStart = ProfileBegin("Follower.Task.Transition.WorldToScreen");
+                            try { screenPos = WorldToValidScreenPosition(targetWorld); }
+                            finally { ProfileEnd("Follower.Task.Transition.WorldToScreen", __transitionScreenProfileStart); }
+                        }
 
                         if (taskDistance <= Settings.General.ClearPathDistance.Value)
                         {
-                            // MapChecker behavior: hover first, then click after a short delay so the game registers
-                            // the portal under cursor. This is much more reliable than clicking a guessed label/point.
-                            if (portal != null)
+                            // Hover first, then click after a short delay so the game registers the portal under cursor.
+                            if (portalTarget != null)
                             {
-                                if (TryHoverThenClickPortal(portal, screenPos))
+                                if (TryHoverThenClickPortal(portalTarget, screenPos))
                                 {
                                     _nextBotAction = _portalHoverClickAt == DateTime.MinValue
                                         ? DateTime.Now.AddSeconds(1)
@@ -1802,6 +1822,16 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
         }
     }
 
+    private sealed class PortalTarget
+    {
+        public dynamic LabelElement { get; set; }
+        public Vector2 ClickPosition { get; set; }
+        public Vector3 WorldPosition { get; set; }
+        public uint EntityId { get; set; }
+        public string MetadataPath { get; set; }
+        public bool FromLabel { get; set; }
+    }
+
     private sealed class ArenaTransitionTarget
     {
         public dynamic LabelElement { get; set; }
@@ -1899,14 +1929,24 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
     {
         try
         {
-            var path = entity?.Path;
-            return !string.IsNullOrEmpty(path) &&
-                   path.IndexOf(MapCheckerPortalPath, StringComparison.OrdinalIgnoreCase) >= 0;
+            return IsSupportedHideoutPortalMetadataPath(entity?.Path);
         }
         catch
         {
             return false;
         }
+    }
+
+    private static bool IsSupportedHideoutPortalMetadataPath(string path)
+    {
+        if (string.IsNullOrWhiteSpace(path))
+            return false;
+
+        var normalized = path.Replace('\\', '/').Trim();
+
+        return normalized.IndexOf(MapCheckerPortalPath, StringComparison.OrdinalIgnoreCase) >= 0 ||
+               normalized.StartsWith(TownPortalMtxMetadataPrefix, StringComparison.OrdinalIgnoreCase) ||
+               normalized.StartsWith(HideoutPortalMetadataPrefix, StringComparison.OrdinalIgnoreCase);
     }
 
     private bool IsAbyssSubAreaTransitionEntity(Entity entity)
@@ -1923,14 +1963,190 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
         }
     }
 
+    private PortalTarget ResolveBestHideoutPortalTarget()
+    {
+        using var __profileScope = ProfileScope("Follower.Portal.ResolveBestHideoutPortalTarget");
+
+        var labelTarget = FindNearestVisibleHideoutPortalLabel();
+        if (labelTarget != null)
+            return labelTarget;
+
+        var entity = FindNearestMapCheckerPortal(requireTargetable: false);
+        return entity == null ? null : ToPortalTarget(entity);
+    }
+
+    private PortalTarget FindNearestVisibleHideoutPortalLabel()
+    {
+        using var __profileScope = ProfileScope("Follower.Portal.FindNearestVisibleHideoutPortalLabel");
+
+        try
+        {
+            dynamic ingameUi = GameController.IngameState?.IngameUi;
+            if (ingameUi == null)
+                return null;
+
+            dynamic labelsElement = null;
+            try { labelsElement = ingameUi.ItemsOnGroundLabelsElement; } catch { labelsElement = null; }
+            if (labelsElement == null)
+            {
+                // Compatibility with dumps/builds that expose the singular property name.
+                try { labelsElement = ingameUi.ItemsOnGroundLabelElement; } catch { labelsElement = null; }
+            }
+
+            dynamic visibleLabels = null;
+            try { visibleLabels = labelsElement?.LabelsOnGroundVisible; } catch { visibleLabels = null; }
+            if (visibleLabels == null)
+            {
+                // Compatibility with dumps/builds that expose the singular property name.
+                try { visibleLabels = labelsElement?.LabelOnGroundVisible; } catch { visibleLabels = null; }
+            }
+
+            var target = FindPortalTargetInLabelCollection(visibleLabels, PortalLabelScanMaxVisibleLabels);
+            if (target != null)
+                return target;
+
+            // Fallback only. Keep capped; the full ground-label collection can be large on maps.
+            dynamic directLabels = null;
+            try { directLabels = ingameUi.ItemsOnGroundLabels; } catch { directLabels = null; }
+            return FindPortalTargetInLabelCollection(directLabels, PortalLabelScanMaxVisibleLabels);
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private PortalTarget FindPortalTargetInLabelCollection(dynamic labels, int maxLabelsToInspect)
+    {
+        if (labels == null)
+            return null;
+
+        var inspected = 0;
+        PortalTarget best = null;
+        float bestScore = float.MaxValue;
+
+        Vector3 playerPos;
+        try { playerPos = GameController.Player.Pos; }
+        catch { playerPos = Vector3.Zero; }
+
+        var anchor = _lastTargetPosition != Vector3.Zero ? _lastTargetPosition : playerPos;
+
+        try
+        {
+            foreach (dynamic groundLabel in labels)
+            {
+                if (groundLabel == null)
+                    continue;
+
+                inspected++;
+                if (inspected > maxLabelsToInspect)
+                    break;
+
+                var target = TryReadPortalTarget(groundLabel);
+                if (target == null)
+                    continue;
+
+                var score = ScorePortalTarget(target, playerPos, anchor);
+                if (score < bestScore)
+                {
+                    bestScore = score;
+                    best = target;
+                }
+            }
+        }
+        catch
+        {
+            // UI memory can mutate while enumerating visible labels. Return the best target found so far.
+        }
+
+        return best;
+    }
+
+    private float ScorePortalTarget(PortalTarget target, Vector3 playerPos, Vector3 anchor)
+    {
+        if (target != null && target.WorldPosition != Vector3.Zero && playerPos != Vector3.Zero)
+        {
+            var distanceFromPlayer = Vector3.Distance(playerPos, target.WorldPosition);
+            var distanceFromLeaderLastPos = anchor != Vector3.Zero ? Vector3.Distance(anchor, target.WorldPosition) : 0f;
+            return distanceFromPlayer + (distanceFromLeaderLastPos * 0.25f);
+        }
+
+        // If world position is not available, still prefer real visible labels over entity fallback.
+        return 0f;
+    }
+
+    private PortalTarget TryReadPortalTarget(dynamic groundLabel)
+    {
+        try
+        {
+            dynamic labelElement = null;
+            try { labelElement = groundLabel.Label; } catch { labelElement = null; }
+            if (labelElement == null || !IsVisibleElement(labelElement))
+                return null;
+
+            var itemOnGround = EntityFromGroundLabel(groundLabel);
+            var path = PathOf(itemOnGround);
+            if (!IsSupportedHideoutPortalMetadataPath(path))
+                return null;
+
+            var center = CenterOfElement(labelElement);
+            if (center == Vector2.Zero)
+                return null;
+
+            return new PortalTarget
+            {
+                LabelElement = labelElement,
+                ClickPosition = center,
+                WorldPosition = PositionOf(itemOnGround),
+                EntityId = StableEntityId(IdOf(itemOnGround), path, center),
+                MetadataPath = path,
+                FromLabel = true
+            };
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private static dynamic EntityFromGroundLabel(dynamic groundLabel)
+    {
+        if (groundLabel == null)
+            return null;
+
+        try
+        {
+            var entity = groundLabel.ItemOnGround;
+            if (entity != null) return entity;
+        }
+        catch { }
+
+        try
+        {
+            var entity = groundLabel.Entity;
+            if (entity != null) return entity;
+        }
+        catch { }
+
+        try
+        {
+            var entity = groundLabel.Item;
+            if (entity != null) return entity;
+        }
+        catch { }
+
+        return null;
+    }
+
     private Entity FindNearestMapCheckerPortal(bool requireTargetable)
     {
-        using var __profileScope = ProfileScope("Follower.Portal.FindNearestMapCheckerPortal");
+        using var __profileScope = ProfileScope("Follower.Portal.FindNearestMetadataPortalEntity");
         Entity[] entities;
 
         try
         {
             entities = GameController.EntityListWrapper?.Entities?.ToArray()
+                       ?? GameController.Entities?.ToArray()
                        ?? Array.Empty<Entity>();
         }
         catch
@@ -1975,18 +2191,57 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
         return best;
     }
 
-    private bool TryHoverThenClickPortal(Entity portal, Vector2 screenPos)
+    private PortalTarget ToPortalTarget(Entity entity)
+    {
+        if (entity == null)
+            return null;
+
+        try
+        {
+            var worldPosition = entity.Pos;
+            return new PortalTarget
+            {
+                LabelElement = null,
+                ClickPosition = WorldToValidScreenPosition(worldPosition),
+                WorldPosition = worldPosition,
+                EntityId = StableEntityId(entity.Id, entity.Path, Vector2.Zero),
+                MetadataPath = entity.Path,
+                FromLabel = false
+            };
+        }
+        catch
+        {
+            return null;
+        }
+    }
+
+    private bool TryHoverThenClickPortal(PortalTarget portal, Vector2 screenPos)
     {
         using var __profileScope = ProfileScope("Follower.Portal.TryHoverThenClickPortal");
         if (portal == null) return false;
 
         var now = DateTime.Now;
+        var entityId = portal.EntityId;
+        var clickPos = screenPos != Vector2.Zero ? screenPos : portal.ClickPosition;
+        if (clickPos == Vector2.Zero && portal.WorldPosition != Vector3.Zero)
+            clickPos = WorldToValidScreenPosition(portal.WorldPosition);
 
-        if (_portalHoverEntityId != portal.Id || _portalHoverClickAt == DateTime.MinValue)
+        if (clickPos == Vector2.Zero)
+            return false;
+
+        var offset = Math.Max(0, Settings.General.RandomClickOffset.Value);
+        if (offset > 0 && portal.FromLabel)
+        {
+            clickPos += new Vector2(
+                random.Next(-offset, offset + 1),
+                random.Next(-Math.Max(1, offset / 2), Math.Max(1, offset / 2) + 1));
+        }
+
+        if (_portalHoverEntityId != entityId || _portalHoverClickAt == DateTime.MinValue)
         {
             PrepareForPluginMouseAction("Follower.Portal.Hover.Prepare");
-            if (!Mouse.IsGuardLocked) Mouse.SetCursorPosHuman2(screenPos);
-            _portalHoverEntityId = portal.Id;
+            if (!Mouse.IsGuardLocked) Mouse.SetCursorPosHuman2(clickPos);
+            _portalHoverEntityId = entityId;
             _portalHoverClickAt = now.AddMilliseconds(PortalHoverDelayMs);
             return true;
         }
@@ -1995,10 +2250,11 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
             return true;
 
         PrepareForPluginMouseAction("Follower.Portal.Click.Prepare");
-        if (!Mouse.IsGuardLocked) Mouse.SetCursorPosAndLeftClickHuman(screenPos, 0);
+        if (!Mouse.IsGuardLocked) Mouse.SetCursorPosAndLeftClickHuman(clickPos, 0);
         CompletePluginMouseAction("Follower.Portal.Click.Complete");
         ResetPendingPortalClick();
         _nextBotAction = now.AddSeconds(1);
+        try { LogMessage($"Portal: clicked {(portal.FromLabel ? "label" : "entity")} ({portal.MetadataPath})", 3); } catch { }
         return true;
     }
 
@@ -2006,6 +2262,31 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
     {
         _portalHoverEntityId = 0;
         _portalHoverClickAt = DateTime.MinValue;
+    }
+
+    private static uint StableEntityId(uint entityId, string path, Vector2 clickPosition)
+    {
+        if (entityId != 0)
+            return entityId;
+
+        unchecked
+        {
+            uint hash = 2166136261u;
+            if (!string.IsNullOrEmpty(path))
+            {
+                foreach (var ch in path)
+                {
+                    hash ^= (uint)char.ToUpperInvariant(ch);
+                    hash *= 16777619u;
+                }
+            }
+
+            hash ^= (uint)Math.Round(clickPosition.X);
+            hash *= 16777619u;
+            hash ^= (uint)Math.Round(clickPosition.Y);
+            hash *= 16777619u;
+            return hash == 0 ? 1u : hash;
+        }
     }
 
     private Vector2 WorldToValidScreenPosition(Vector3 worldPos)
