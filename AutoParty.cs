@@ -45,6 +45,8 @@ namespace Follower
 
         public AutoParty(Follower plugin) { _plugin = plugin; _scanDebug = new AutoPartyScanDebugLogger(plugin); }
 
+        public string Status { get; private set; } = "Idle";
+
         public void TickDebugHotkey()
         {
             using var __profileScope = _plugin.ProfileScope("AutoParty.TickDebugHotkey");
@@ -55,26 +57,34 @@ namespace Follower
         private dynamic Ingame => _plugin.GameController.IngameState;
         private dynamic UI => _plugin.GameController.IngameState?.IngameUi;
 
-        public void Tick()
+        public bool Tick()
         {
             using var __profileScope = _plugin.ProfileScope("AutoParty.Tick.Total");
             var s = _plugin.Settings;
+            Status = "Idle";
             if (!s.Enable || (!s.TpTrade.AutoAcceptParty.Value && !s.TpTrade.AutoAcceptTrade.Value))
-                return;
+                return false;
 
-            if ((DateTime.UtcNow - _lastAttempt).TotalMilliseconds < s.TpTrade.AutoPartyPollMs.Value) return;
+            if ((DateTime.UtcNow - _lastAttempt).TotalMilliseconds < s.TpTrade.AutoPartyPollMs.Value) return false;
             _lastAttempt = DateTime.UtcNow;
 
             try
             {
                 if (s.TpTrade.AutoAcceptParty.Value || s.TpTrade.AutoAcceptTrade.Value)
-                    TryAcceptInvites(s.TpTrade.AutoAcceptParty.Value, s.TpTrade.AutoAcceptTrade.Value);
+                {
+                    var accepted = TryAcceptInvites(s.TpTrade.AutoAcceptParty.Value, s.TpTrade.AutoAcceptTrade.Value);
+                    Status = accepted ? "accepted invite/trade popup" : "scanned, no matching popup";
+                    return accepted;
+                }
 
             }
             catch (Exception ex)
             {
+                Status = "error: " + ex.Message;
                 _plugin.LogMessage($"AutoParty error: {ex.Message}", 5);
             }
+
+            return false;
         }
 
         private static System.Collections.Generic.IReadOnlyList<string> GetAllowedInviters(FollowerSettings s)
@@ -100,10 +110,10 @@ namespace Follower
             return false;
         }
 
-        private void TryAcceptInvites(bool acceptParty, bool acceptTrade)
+        private bool TryAcceptInvites(bool acceptParty, bool acceptTrade)
         {
             using var __profileScope = _plugin.ProfileScope("AutoParty.TryAcceptInvites");
-            if (!acceptParty && !acceptTrade) return;
+            if (!acceptParty && !acceptTrade) return false;
 
             bool ok = false;
             _scanDebug.BeginTick(acceptParty, acceptTrade);
@@ -117,6 +127,7 @@ namespace Follower
                     ok = FindAndClickSocialAccept(acceptParty, acceptTrade);
                     _scanDebug.Event("TryAcceptInvites", "Social scan result=" + ok);
                 }
+                return ok;
             }
             finally
             {

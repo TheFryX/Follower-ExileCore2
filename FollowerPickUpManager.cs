@@ -19,7 +19,6 @@ namespace Follower;
 internal sealed class FollowerPickUpManager
 {
     private const int HoverDelayMs = 85;
-    private const int PostClickPickupSettleMs = 650;
     private const int MissingTargetRetryMs = 125;
     private const int MissingTargetGraceMs = 900;
     private const int MinMovementActionGapMs = 95;
@@ -62,6 +61,27 @@ internal sealed class FollowerPickUpManager
     public FollowerPickUpManager(Follower plugin)
     {
         _plugin = plugin;
+    }
+
+    public bool IsActive => _state != PickupState.Idle;
+
+    public string Status => _state == PickupState.Idle
+        ? "Idle"
+        : $"{_state}: {_currentTarget?.DisplayName ?? "no target"} attempts={_currentTarget?.Attempts ?? 0}";
+
+    private int GetPickupClickDelayMs()
+    {
+        try
+        {
+            return Math.Clamp(
+                _plugin.Settings?.PickUp?.PauseBetweenClicksMs?.Value ?? FixedPauseBetweenPickupClicksMs,
+                90,
+                750);
+        }
+        catch
+        {
+            return FixedPauseBetweenPickupClicksMs;
+        }
     }
 
     public void Reset(string reason)
@@ -368,6 +388,9 @@ internal sealed class FollowerPickUpManager
         if (!IsPickUpEverythingEnabled() && _compiledRules.Count == 0)
             return false;
 
+        if (IsInventoryReserveReached())
+            return false;
+
         if (!CanStartPickupNearLeader())
             return false;
 
@@ -448,13 +471,13 @@ internal sealed class FollowerPickUpManager
             return false;
         }
 
-        _nextActionAt = now.AddMilliseconds(FixedPauseBetweenPickupClicksMs);
+        _nextActionAt = now.AddMilliseconds(GetPickupClickDelayMs());
         return true;
     }
 
     private bool TickMissingTarget(DateTime now)
     {
-        if (_lastPickupClickAt != DateTime.MinValue && (now - _lastPickupClickAt).TotalMilliseconds >= 250)
+        if (_lastPickupClickAt != DateTime.MinValue && (now - _lastPickupClickAt).TotalMilliseconds >= GetPickupClickDelayMs())
         {
             CompletePickup("item disappeared after click");
             return false;
@@ -504,7 +527,7 @@ internal sealed class FollowerPickUpManager
                 return false;
             }
 
-            _nextActionAt = now.AddMilliseconds(FixedPauseBetweenPickupClicksMs);
+            _nextActionAt = now.AddMilliseconds(GetPickupClickDelayMs());
             return true;
         }
 
@@ -539,7 +562,7 @@ internal sealed class FollowerPickUpManager
         _lastPickupClickAt = now;
         _targetMissingSince = DateTime.MinValue;
         _state = PickupState.WaitingAfterClick;
-        _nextActionAt = now.AddMilliseconds(Math.Max(PostClickPickupSettleMs, FixedPauseBetweenPickupClicksMs));
+        _nextActionAt = now.AddMilliseconds(GetPickupClickDelayMs());
         _hoverClickAt = DateTime.MinValue;
         _hoverEntityId = 0;
         return true;
@@ -549,6 +572,7 @@ internal sealed class FollowerPickUpManager
     {
         try { _plugin.LogMessage("PickUp: finished, " + reason + "; resuming follow.", 3); } catch { }
         Reset("Complete");
+        _nextScanAt = DateTime.MinValue;
     }
 
     private bool IsSafeAutomationContext()
@@ -1239,6 +1263,40 @@ internal sealed class FollowerPickUpManager
 
         _lastLoggedCompileErrors = _lastCompileErrors;
         try { _plugin.LogMessage("PickUp rule compile errors: " + _lastCompileErrors, 5); } catch { }
+    }
+
+    private bool IsInventoryReserveReached()
+    {
+        try
+        {
+            var reserveCells = Math.Max(0, _plugin.Settings.PickUp.MinimumFreeInventorySlots.Value);
+            if (reserveCells <= 0)
+                return false;
+
+            var inventory = GetPlayerInventory();
+            if (inventory == null)
+                return false;
+
+            var occupied = GetContainer2DArray(inventory);
+            if (occupied == null)
+                return false;
+
+            var free = 0;
+            for (var y = 0; y < inventory.Rows; y++)
+            for (var x = 0; x < inventory.Columns; x++)
+            {
+                if (!occupied[y, x])
+                    free++;
+                if (free > reserveCells)
+                    return false;
+            }
+
+            return free <= reserveCells;
+        }
+        catch
+        {
+            return false;
+        }
     }
 
     private bool CanFitInventory(ItemData item)

@@ -1,4 +1,4 @@
-﻿using System;
+using System;
 using System.Collections.Generic;
 using System.Linq;
 using System.Numerics;
@@ -11,11 +11,13 @@ namespace Follower
 {
     internal sealed class TradeInventoryDump
     {
-        private const int KeyDelayMs = 10;
-        private const int MouseMoveDelayMs = 20;
-        private const int MouseDownDelayMs = 10;
-        private const int MouseUpDelayMs = 5;
+        private const int KeyDelayMs = 35;
+        private const int MouseMoveDelayMs = 45;
+        private const int MouseDownDelayMs = 35;
+        private const int MouseUpDelayMs = 20;
         private const int AcceptRetryDelayMs = 500;
+        private const int DumpPassVerifyDelayMs = 450;
+        private const int MaxDumpPasses = 5;
         private const int MaxAcceptAttempts = 6;
         private const int AcceptGlobalScanMaxNodes = 20000;
         private const int AcceptGlobalScanMaxDepth = 32;
@@ -33,9 +35,11 @@ namespace Follower
 
         private DumpState _state = DumpState.Idle;
         private ClickPhase _clickPhase = ClickPhase.None;
-        private List<ServerInventory.InventSlotItem> _items = new List<ServerInventory.InventSlotItem>();
+        private List<DumpItemTarget> _items = new List<DumpItemTarget>();
         private int _ignoredItemsSkippedInSnapshot;
         private int _itemIndex;
+        private int _dumpPass;
+        private int _lastResidualCount;
         private DateTime _nextActionAt = DateTime.MinValue;
         private DateTime _startedAt = DateTime.MinValue;
         private DateTime _finishDeadline = DateTime.MinValue;
@@ -62,6 +66,10 @@ namespace Follower
 
         public bool IsActive => _state != DumpState.Idle;
 
+        public string Status => _state == DumpState.Idle
+            ? "Idle"
+            : $"{_state} item={Math.Min(_itemIndex + 1, Math.Max(1, _items.Count))}/{Math.Max(1, _items.Count)} acceptAttempts={_acceptAttempts}";
+
         public void Start(string leaderName, string commandText)
         {
             try
@@ -84,6 +92,8 @@ namespace Follower
                 _finishDeadline = DateTime.MinValue;
                 _nextFinishChatScanAt = DateTime.MinValue;
                 _itemIndex = 0;
+                _dumpPass = 0;
+                _lastResidualCount = 0;
                 _ignoredItemsSkippedInSnapshot = 0;
                 _items.Clear();
                 _clickPhase = ClickPhase.None;
@@ -130,6 +140,9 @@ namespace Follower
 
                     case DumpState.DumpingItems:
                         return TickDumpingItems(now);
+
+                    case DumpState.VerifyDumpComplete:
+                        return TickVerifyDumpComplete(now);
 
                     case DumpState.WaitBeforeAccept:
                         return TickWaitBeforeAccept(now);
@@ -202,6 +215,8 @@ namespace Follower
                 return true;
             }
 
+            _dumpPass = 1;
+            _lastResidualCount = _items.Count;
             var dumpMessage = _ignoredItemsSkippedInSnapshot > 0
                 ? $"TradeDump: dumping {_items.Count} inventory item(s) to trade; skipped {_ignoredItemsSkippedInSnapshot} ignored item(s)."
                 : $"TradeDump: dumping {_items.Count} inventory item(s) to trade.";
@@ -225,9 +240,9 @@ namespace Follower
             if (_itemIndex >= _items.Count)
             {
                 ReleaseCtrlIfHeld();
-                _state = DumpState.WaitBeforeAccept;
-                _nextActionAt = now.AddMilliseconds(GetAcceptDelayAfterDumpMs());
-                _plugin.LogMessage("TradeDump: inventory dump clicks finished; preparing accept click.", 3);
+                _state = DumpState.VerifyDumpComplete;
+                _nextActionAt = now.AddMilliseconds(DumpPassVerifyDelayMs);
+                _plugin.LogMessage($"TradeDump: dump pass {_dumpPass} click sweep finished; verifying remaining inventory items.", 3);
                 return true;
             }
 
@@ -267,7 +282,7 @@ namespace Follower
                     _plugin.CompletePluginMouseAction("TradeDump.ItemClick.Complete");
                     _itemIndex++;
                     _clickPhase = ClickPhase.BetweenItems;
-                    _nextActionAt = now.AddMilliseconds(Math.Max(20, _plugin.Settings.TpTrade.TradeDumpItemDelayMs.Value));
+                    _nextActionAt = now.AddMilliseconds(Math.Max(55, _plugin.Settings.TpTrade.TradeDumpItemDelayMs.Value));
                     return true;
 
                 default:
@@ -276,16 +291,71 @@ namespace Follower
             }
         }
 
+        private bool TickVerifyDumpComplete(DateTime now)
+        {
+            ReleaseCtrlIfHeld();
+
+            if (!IsTradeWindowOpen())
+            {
+                Abort("trade window closed while verifying dump");
+                return false;
+            }
+
+            if (now < _nextActionAt)
+                return true;
+
+            bool visualVerificationReliable;
+            var residualItems = GetResidualItemsForRetry(_items, out visualVerificationReliable);
+            _items = residualItems;
+            _itemIndex = 0;
+            _clickPhase = ClickPhase.None;
+
+            if (!visualVerificationReliable)
+            {
+                _plugin.LogMessage("TradeDump: visual inventory verification unavailable; accepting after one click sweep to avoid false residual loops.", 3);
+                _state = DumpState.WaitBeforeAccept;
+                _nextActionAt = now.AddMilliseconds(GetAcceptDelayAfterDumpMs());
+                return true;
+            }
+
+            if (_items.Count == 0)
+            {
+                _plugin.LogMessage($"TradeDump: all dumpable inventory items transferred after {_dumpPass} pass(es); preparing accept click.", 3);
+                _state = DumpState.WaitBeforeAccept;
+                _nextActionAt = now.AddMilliseconds(GetAcceptDelayAfterDumpMs());
+                return true;
+            }
+
+            if (_dumpPass >= MaxDumpPasses)
+            {
+                _plugin.LogMessage($"TradeDump: {_items.Count} dumpable item(s) still remained after {MaxDumpPasses} pass(es); not accepting incomplete trade.", 5);
+                Abort("dump verification failed; residual items remain");
+                return false;
+            }
+
+            _dumpPass++;
+            var previousResidualCount = _lastResidualCount;
+            _lastResidualCount = _items.Count;
+            var progressText = _items.Count < previousResidualCount
+                ? "residual count decreased"
+                : "residual count unchanged/increased";
+
+            _plugin.LogMessage($"TradeDump: {_items.Count} item(s) still visible in inventory after pass {_dumpPass - 1}; retrying only missed item(s), pass {_dumpPass} ({progressText}).", 3);
+            _state = DumpState.DumpingItems;
+            _nextActionAt = now.AddMilliseconds(Math.Max(55, _plugin.Settings.TpTrade.TradeDumpItemDelayMs.Value));
+            return true;
+        }
+
         private void BeginCurrentItemClick(DateTime now)
         {
             var item = _items[_itemIndex];
-            _currentItemScreenPos = GetItemCenterScreen(item);
+            _currentItemScreenPos = item.ScreenCenter;
             if (!IsReasonablePoint(_currentItemScreenPos))
             {
-                _plugin.LogMessage($"TradeDump: skipped item #{_itemIndex + 1}; invalid screen position {_currentItemScreenPos}.", 3);
+                _plugin.LogMessage($"TradeDump: skipped item #{_itemIndex + 1} {item.DebugLabel}; invalid screen position {_currentItemScreenPos}.", 3);
                 _itemIndex++;
                 _clickPhase = ClickPhase.BetweenItems;
-                _nextActionAt = now.AddMilliseconds(Math.Max(20, _plugin.Settings.TpTrade.TradeDumpItemDelayMs.Value));
+                _nextActionAt = now.AddMilliseconds(Math.Max(55, _plugin.Settings.TpTrade.TradeDumpItemDelayMs.Value));
                 return;
             }
 
@@ -299,6 +369,12 @@ namespace Follower
         private bool TickWaitBeforeAccept(DateTime now)
         {
             ReleaseCtrlIfHeld();
+
+            if (!(_plugin.Settings.TpTrade.AutoAcceptTradeAfterDump?.Value ?? true))
+            {
+                Complete("auto accept after dump disabled");
+                return false;
+            }
 
             if (!IsTradeWindowOpen())
             {
@@ -392,7 +468,7 @@ namespace Follower
             return true;
         }
 
-        private List<ServerInventory.InventSlotItem> GetInventoryItemsSnapshot()
+        private List<DumpItemTarget> GetInventoryItemsSnapshot()
         {
             _ignoredItemsSkippedInSnapshot = 0;
 
@@ -408,19 +484,18 @@ namespace Follower
                     .ThenBy(x => x.PosX)
                     .ToList();
 
-                if (InventoryGridIgnoreHelper.CountIgnoredCells(ignoredCells) == 0)
-                    return inventoryItems;
-
-                var dumpableItems = new List<ServerInventory.InventSlotItem>(inventoryItems.Count);
+                var dumpableItems = new List<DumpItemTarget>(inventoryItems.Count);
                 foreach (var item in inventoryItems)
                 {
-                    if (InventoryGridIgnoreHelper.IsIgnored(item, ignoredCells))
+                    if (InventoryGridIgnoreHelper.CountIgnoredCells(ignoredCells) > 0 && InventoryGridIgnoreHelper.IsIgnored(item, ignoredCells))
                     {
                         _ignoredItemsSkippedInSnapshot++;
                         continue;
                     }
 
-                    dumpableItems.Add(item);
+                    var target = CreateDumpItemTarget(item);
+                    if (target != null)
+                        dumpableItems.Add(target);
                 }
 
                 return dumpableItems;
@@ -428,8 +503,293 @@ namespace Follower
             catch (Exception ex)
             {
                 _plugin.LogMessage("TradeDump: inventory read failed: " + ex.Message, 5);
-                return new List<ServerInventory.InventSlotItem>();
+                return new List<DumpItemTarget>();
             }
+        }
+
+        private DumpItemTarget CreateDumpItemTarget(ServerInventory.InventSlotItem item)
+        {
+            try
+            {
+                var rect = item.GetClientRect();
+                var center = rect.Center;
+                var topLeft = rect.TopLeft;
+                var bottomRight = rect.BottomRight;
+
+                var clientCenter = new Vector2(Convert.ToSingle(center.X), Convert.ToSingle(center.Y));
+                var screenCenter = clientCenter + WindowOffset;
+                if (!IsReasonablePoint(screenCenter))
+                    return null;
+
+                var debugLabel = $"slot=({item.PosX},{item.PosY}) size=({item.SizeX}x{item.SizeY})";
+                try
+                {
+                    var path = item.Item?.Path;
+                    if (!string.IsNullOrWhiteSpace(path))
+                        debugLabel += " path=" + path;
+                }
+                catch { }
+
+                return new DumpItemTarget
+                {
+                    PosX = item.PosX,
+                    PosY = item.PosY,
+                    SizeX = item.SizeX,
+                    SizeY = item.SizeY,
+                    ClientCenter = clientCenter,
+                    ScreenCenter = screenCenter,
+                    ClientLeft = Convert.ToSingle(topLeft.X),
+                    ClientTop = Convert.ToSingle(topLeft.Y),
+                    ClientRight = Convert.ToSingle(bottomRight.X),
+                    ClientBottom = Convert.ToSingle(bottomRight.Y),
+                    DebugLabel = debugLabel
+                };
+            }
+            catch
+            {
+                return null;
+            }
+        }
+
+        private List<DumpItemTarget> GetResidualItemsForRetry(List<DumpItemTarget> lastPassItems, out bool visualVerificationReliable)
+        {
+            visualVerificationReliable = false;
+            var residual = new List<DumpItemTarget>();
+
+            if (lastPassItems == null || lastPassItems.Count == 0)
+                return residual;
+
+            if (!TryGetVisibleInventoryItemClientCenters(out var visibleCenters) || visibleCenters.Count == 0)
+                return residual;
+
+            visualVerificationReliable = true;
+
+            foreach (var target in lastPassItems)
+            {
+                if (IsTargetStillVisibleInInventory(target, visibleCenters))
+                    residual.Add(target);
+            }
+
+            return residual;
+        }
+
+        private bool TryGetVisibleInventoryItemClientCenters(out List<Vector2> centers)
+        {
+            centers = new List<Vector2>();
+
+            try
+            {
+                dynamic ui = _plugin.GameController.IngameState?.IngameUi;
+                if (ui == null)
+                    return false;
+
+                var candidateNodes = new List<dynamic>();
+
+                dynamic inventoryPanel = null;
+                try { inventoryPanel = ui.InventoryPanel; } catch { inventoryPanel = null; }
+                AddIfNotNull(candidateNodes, inventoryPanel);
+                AddIfNotNull(candidateNodes, GetChild(inventoryPanel, 2));
+
+                dynamic openRightInventoryPanel = null;
+                try { openRightInventoryPanel = ui.OpenRightPanel?.InventoryPanel; } catch { openRightInventoryPanel = null; }
+                AddIfNotNull(candidateNodes, openRightInventoryPanel);
+                AddIfNotNull(candidateNodes, GetChild(openRightInventoryPanel, 2));
+
+                foreach (var node in candidateNodes)
+                    AddVisibleInventoryCentersFromNode(node, centers);
+
+                return centers.Count > 0;
+            }
+            catch
+            {
+                centers.Clear();
+                return false;
+            }
+        }
+
+        private void AddVisibleInventoryCentersFromNode(dynamic node, List<Vector2> centers)
+        {
+            if (node == null) return;
+
+            dynamic visibleItems = null;
+            try { visibleItems = node.VisibleInventoryItems; } catch { visibleItems = null; }
+            AddVisibleInventoryCentersFromCollection(visibleItems, centers);
+
+            dynamic inventoryItems = null;
+            try { inventoryItems = node.InventorySlotItems; } catch { inventoryItems = null; }
+            AddVisibleInventoryCentersFromCollection(inventoryItems, centers);
+
+            dynamic items = null;
+            try { items = node.Items; } catch { items = null; }
+            AddVisibleInventoryCentersFromCollection(items, centers);
+        }
+
+        private void AddVisibleInventoryCentersFromCollection(dynamic collection, List<Vector2> centers)
+        {
+            if (collection == null) return;
+
+            foreach (var obj in EnumerateDynamicCollection(collection, 200))
+            {
+                Vector2 center;
+                if (TryGetVisualInventoryItemClientCenter(obj, out center))
+                    AddDistinctPoint(centers, center);
+            }
+        }
+
+        private static IEnumerable<object> EnumerateDynamicCollection(dynamic collection, int maxItems)
+        {
+            if (collection == null || maxItems <= 0)
+                yield break;
+
+            if (collection is System.Collections.IEnumerable enumerable)
+            {
+                var emitted = 0;
+                foreach (var item in enumerable)
+                {
+                    if (item != null)
+                        yield return item;
+
+                    emitted++;
+                    if (emitted >= maxItems)
+                        yield break;
+                }
+
+                yield break;
+            }
+
+            var count = Math.Min(maxItems, CountOf(collection));
+            for (var i = 0; i < count; i++)
+            {
+                object item = null;
+                try { item = collection[i]; } catch { item = null; }
+                if (item != null)
+                    yield return item;
+            }
+        }
+
+        private static bool TryGetVisualInventoryItemClientCenter(dynamic item, out Vector2 center)
+        {
+            center = Vector2.Zero;
+            if (item == null)
+                return false;
+
+            try
+            {
+                var rect = item.GetClientRectCache;
+                if (TryGetCenterFromRect(rect, out center))
+                    return true;
+            }
+            catch { }
+
+            try
+            {
+                var rect = item.GetClientRect();
+                if (TryGetCenterFromRect(rect, out center))
+                    return true;
+            }
+            catch { }
+
+            try
+            {
+                var rect = item.GetClientRectCache();
+                if (TryGetCenterFromRect(rect, out center))
+                    return true;
+            }
+            catch { }
+
+            return false;
+        }
+
+        private static bool TryGetCenterFromRect(dynamic rect, out Vector2 center)
+        {
+            center = Vector2.Zero;
+            if (rect == null)
+                return false;
+
+            try
+            {
+                var rawCenter = rect.Center;
+                if (TryConvertToVector2(rawCenter, out center))
+                    return IsReasonableClientPoint(center);
+            }
+            catch { }
+
+            try
+            {
+                var topLeft = rect.TopLeft;
+                var bottomRight = rect.BottomRight;
+                var tl = Vector2.Zero;
+                var br = Vector2.Zero;
+                if (!TryConvertToVector2(topLeft, out tl) || !TryConvertToVector2(bottomRight, out br))
+                    return false;
+
+                center = new Vector2((tl.X + br.X) / 2f, (tl.Y + br.Y) / 2f);
+                return IsReasonableClientPoint(center);
+            }
+            catch { }
+
+            return false;
+        }
+
+        private static bool TryConvertToVector2(dynamic value, out Vector2 vector)
+        {
+            vector = Vector2.Zero;
+            if (value == null)
+                return false;
+
+            try
+            {
+                vector = (Vector2)value;
+                return IsReasonableClientPoint(vector);
+            }
+            catch { }
+
+            try
+            {
+                vector = new Vector2(Convert.ToSingle(value.X), Convert.ToSingle(value.Y));
+                return IsReasonableClientPoint(vector);
+            }
+            catch
+            {
+                return false;
+            }
+        }
+
+        private static void AddDistinctPoint(List<Vector2> points, Vector2 point)
+        {
+            foreach (var existing in points)
+            {
+                if (Vector2.Distance(existing, point) <= 1.5f)
+                    return;
+            }
+
+            points.Add(point);
+        }
+
+        private static bool IsTargetStillVisibleInInventory(DumpItemTarget target, List<Vector2> visibleCenters)
+        {
+            foreach (var center in visibleCenters)
+            {
+                if (IsPointInsideTargetRect(target, center))
+                    return true;
+            }
+
+            return false;
+        }
+
+        private static bool IsPointInsideTargetRect(DumpItemTarget target, Vector2 center)
+        {
+            const float inflate = 3f;
+
+            if (target.ClientRight > target.ClientLeft && target.ClientBottom > target.ClientTop)
+            {
+                return center.X >= target.ClientLeft - inflate &&
+                       center.X <= target.ClientRight + inflate &&
+                       center.Y >= target.ClientTop - inflate &&
+                       center.Y <= target.ClientBottom + inflate;
+            }
+
+            return Vector2.Distance(center, target.ClientCenter) <= 10f;
         }
 
         private Vector2 GetItemCenterScreen(ServerInventory.InventSlotItem item)
@@ -776,15 +1136,24 @@ namespace Follower
                 var targetY = (int)Math.Round(center.Y);
                 var setOk = Mouse.SetCursorPos(targetX, targetY);
                 Thread.Sleep(AcceptMoveSettleMs);
+
                 var afterMove = Mouse.GetCursorPositionVector();
                 var moveDistance = Vector2.Distance(afterMove, new Vector2(targetX, targetY));
+                if (!setOk || moveDistance > 12f)
+                {
+                    _plugin.CompletePluginMouseAction(reason + ".CompleteMoveFailed");
+                    WriteAcceptDebug($"CLICK move failed before button press target={targetX},{targetY} setCursorOk={setOk} cursorAfterMove={FormatPoint(afterMove)} moveDistance={moveDistance:0.0} reason={reason}");
+                    return false;
+                }
 
+                // Accept is a single low-frequency UI action, not a hot-path movement click.
+                // A short physical settle + hold makes the trade button register reliably on DPI-scaled/fullscreen-windowed setups.
                 Mouse.LeftMouseUp();
-                Thread.Sleep(20);
+                Thread.Sleep(10);
                 Mouse.LeftMouseDown();
                 Thread.Sleep(AcceptMouseDownMs);
                 Mouse.LeftMouseUp();
-                Thread.Sleep(40);
+                Thread.Sleep(25);
 
                 var afterClick = Mouse.GetCursorPositionVector();
                 _plugin.CompletePluginMouseAction(reason + ".Complete");
@@ -1080,6 +1449,8 @@ namespace Follower
             _clickPhase = ClickPhase.None;
             _items.Clear();
             _itemIndex = 0;
+            _dumpPass = 0;
+            _lastResidualCount = 0;
             _ignoredItemsSkippedInSnapshot = 0;
             _nextActionAt = DateTime.MinValue;
             _startedAt = DateTime.MinValue;
@@ -1438,6 +1809,12 @@ namespace Follower
             return new string(chars.ToArray());
         }
 
+        private static bool IsReasonableClientPoint(Vector2 point)
+        {
+            return !(float.IsNaN(point.X) || float.IsNaN(point.Y) || float.IsInfinity(point.X) || float.IsInfinity(point.Y)) &&
+                   point.X >= 0 && point.Y >= 0 && point.X < 10000 && point.Y < 10000;
+        }
+
         private static bool IsReasonablePoint(Vector2 point)
         {
             return !(float.IsNaN(point.X) || float.IsNaN(point.Y) || float.IsInfinity(point.X) || float.IsInfinity(point.Y)) &&
@@ -1450,6 +1827,7 @@ namespace Follower
             WaitForTradeWindow,
             PrepareInventorySnapshot,
             DumpingItems,
+            VerifyDumpComplete,
             WaitBeforeAccept,
             Accepting,
             WaitingForFinish
@@ -1481,6 +1859,21 @@ namespace Follower
             public int NodesVisited;
             public int MaxNodes;
             public int MaxDepth;
+        }
+
+        private sealed class DumpItemTarget
+        {
+            public int PosX;
+            public int PosY;
+            public int SizeX;
+            public int SizeY;
+            public Vector2 ClientCenter;
+            public Vector2 ScreenCenter;
+            public float ClientLeft;
+            public float ClientTop;
+            public float ClientRight;
+            public float ClientBottom;
+            public string DebugLabel = string.Empty;
         }
 
         private readonly struct ChatEntry

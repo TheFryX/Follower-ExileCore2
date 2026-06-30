@@ -49,6 +49,9 @@ public class GeneralSettings
     [Menu("Toggle follower hotkey")]
     public HotkeyNode ToggleFollower { get; set; } = Keys.PageUp;
 
+    [Menu("Panic pause hotkey")]
+    public HotkeyNode PanicPauseHotkey { get; set; } = Keys.Pause;
+
 
     [Menu("Leader name")]
     public TextNode LeaderName { get; set; } = new TextNode("");
@@ -73,6 +76,15 @@ public class GeneralSettings
 
     [Menu("Random click offset")]
     public RangeNode<int> RandomClickOffset { get; set; } = new RangeNode<int>(10, 1, 100);
+
+    [Menu("Anti-stuck watchdog")]
+    public ToggleNode AntiStuckWatchdog { get; set; } = new ToggleNode(true);
+
+    [Menu("Anti-stuck no-progress timeout (ms)")]
+    public RangeNode<int> AntiStuckNoProgressMs { get; set; } = new RangeNode<int>(4500, 1500, 20000);
+
+    [Menu("Anti-stuck min progress distance")]
+    public RangeNode<int> AntiStuckMinProgressDistance { get; set; } = new RangeNode<int>(35, 10, 250);
 
     [Menu("Allow Dodge/Sprint")]
     public ToggleNode IsSprintEnabled { get; set; } = new ToggleNode(true);
@@ -153,11 +165,14 @@ public class TpTradeSettings
     [Menu("Auto dump inventory to trade on leader command")]
     public ToggleNode AutoDumpInventoryToTrade { get; set; } = new ToggleNode(true);
 
+    [Menu("Auto accept trade after dump")]
+    public ToggleNode AutoAcceptTradeAfterDump { get; set; } = new ToggleNode(true);
+
     [IgnoreMenu]
     public bool[,] TradeDumpIgnoredCells { get; set; } = new bool[5, 12];
 
     [Menu("Trade dump item delay (ms)")]
-    public RangeNode<int> TradeDumpItemDelayMs { get; set; } = new RangeNode<int>(45, 20, 250);
+    public RangeNode<int> TradeDumpItemDelayMs { get; set; } = new RangeNode<int>(65, 20, 250);
 
     [Menu("Trade accept delay after dump (ms) - internally clamped to min 1600")]
     public RangeNode<int> TradeDumpAcceptDelayMs { get; set; } = new RangeNode<int>(1600, 0, 6000);
@@ -228,7 +243,7 @@ public class PickUpSettings
     [IgnoreMenu]
     public RangeNode<int> ScanIntervalMs { get; set; } = new RangeNode<int>(250, 100, 2000);
 
-    [IgnoreMenu]
+    [Menu("Pickup click delay (ms)", "Delay after clicking a ground item before the next pickup action. Lower = faster pickup, higher = safer on lag/desync.")]
     public RangeNode<int> PauseBetweenClicksMs { get; set; } = new RangeNode<int>(140, 90, 750);
 
     [Menu("Max attempts per item")]
@@ -239,6 +254,9 @@ public class PickUpSettings
 
     [Menu("Max active pickup time (ms)")]
     public RangeNode<int> MaxActivePickupMs { get; set; } = new RangeNode<int>(6500, 1000, 30000);
+
+    [Menu("Stop pickup when free inventory slots <=")]
+    public RangeNode<int> MinimumFreeInventorySlots { get; set; } = new RangeNode<int>(2, 0, 20);
 
     [Menu("No pickup while enemy close")]
     public ToggleNode NoPickupWhileEnemyClose { get; set; } = new ToggleNode(false);
@@ -712,4 +730,16 @@ public class DebugSettings
 
     [Menu("AutoParty reaction context child limit")]
     public RangeNode<int> AutoPartyReactionContextChildLimit { get; set; } = new RangeNode<int>(80, 10, 300);
+
+    [Menu("Show runtime overlay")]
+    public ToggleNode ShowRuntimeOverlay { get; set; } = new ToggleNode(false);
+
+    [Menu("Draw path and transitions")]
+    public ToggleNode DrawPathAndTransitions { get; set; } = new ToggleNode(false);
+
+    [Menu("Runtime overlay X")]
+    public RangeNode<int> RuntimeOverlayX { get; set; } = new RangeNode<int>(500, 0, 4000);
+
+    [Menu("Runtime overlay Y")]
+    public RangeNode<int> RuntimeOverlayY { get; set; } = new RangeNode<int>(120, 0, 2500);
 }

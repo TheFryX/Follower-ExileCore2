@@ -114,11 +114,25 @@ private Random random = new Random();
     private List<TaskNode> _tasks = new List<TaskNode>();
     private DateTime _nextBotAction = DateTime.Now;
 
+    // Runtime diagnostics / watchdog state.
+    private string _runtimeMode = "Init";
+    private string _runtimeDetail = string.Empty;
+    private string _runtimeTarget = string.Empty;
+    private DateTime _runtimeStatusAt = DateTime.MinValue;
+    private TaskNode.TaskNodeType? _watchdogTaskType;
+    private Vector3 _watchdogTaskPosition = Vector3.Zero;
+    private DateTime _watchdogTaskStartedAt = DateTime.MinValue;
+    private DateTime _watchdogLastProgressAt = DateTime.MinValue;
+    private float _watchdogBestTaskDistance = float.MaxValue;
+    private int _watchdogResetCount;
+
     // Non-blocking input scheduler. Never sleep inside Render/Tick.
     private bool _movementKeyDownByPlugin;
     private DateTime _movementKeyReleaseAt = DateTime.MinValue;
     private bool _dodgeSprintTapDownByPlugin;
     private DateTime _dodgeSprintTapReleaseAt = DateTime.MinValue;
+    private bool _escapeTapDownByPlugin;
+    private DateTime _escapeTapReleaseAt = DateTime.MinValue;
     private DateTime _nextForcedInputReleaseAt = DateTime.MinValue;
     private DateTime _nextMovementKeyTapAt = DateTime.MinValue;
     private DateTime _nextForcedMovementKeyUpAt = DateTime.MinValue;
@@ -154,6 +168,8 @@ private Random random = new Random();
 
         Input.RegisterKey(Settings.General.ToggleFollower.Value);
         Settings.General.ToggleFollower.OnValueChanged += () => { Input.RegisterKey(Settings.General.ToggleFollower.Value); };
+        Input.RegisterKey(Settings.General.PanicPauseHotkey.Value);
+        Settings.General.PanicPauseHotkey.OnValueChanged += () => { Input.RegisterKey(Settings.General.PanicPauseHotkey.Value); };
         Input.RegisterKey(Settings.Debug.AutoPartyHoverContextDumpHotkey.Value);
         Settings.Debug.AutoPartyHoverContextDumpHotkey.OnValueChanged += () => { Input.RegisterKey(Settings.Debug.AutoPartyHoverContextDumpHotkey.Value); };
 
@@ -272,6 +288,8 @@ private Random random = new Random();
         _lastCursorMoveTarget = Vector2.Zero;
         ResetPendingPortalClick();
         ResetPendingArenaTransitionClick();
+        ResetTaskWatchdog();
+        SetRuntimeStatus("AreaChange", "pathing reset", "");
         _arenaTransitionRetrySuppressedUntil = DateTime.MinValue;
         _activeArenaTransitionIsAbyssSubArea = false;
     }
@@ -440,6 +458,13 @@ private Random random = new Random();
             _dodgeSprintTapDownByPlugin = false;
         }
 
+        if (_escapeTapDownByPlugin && now >= _escapeTapReleaseAt)
+        {
+            Keyboard.KeyUp(Keys.Escape);
+            _escapeTapDownByPlugin = false;
+            _escapeTapReleaseAt = DateTime.MinValue;
+        }
+
         if (_nextForcedInputReleaseAt != DateTime.MinValue && now >= _nextForcedInputReleaseAt)
         {
             _nextForcedInputReleaseAt = DateTime.MinValue;
@@ -500,11 +525,22 @@ private Random random = new Random();
         _sprintForceReleaseAt = DateTime.MinValue;
     }
 
+    private void ReleaseEscapeKeyNow()
+    {
+        if (_escapeTapDownByPlugin)
+        {
+            Keyboard.KeyUp(Keys.Escape);
+            _escapeTapDownByPlugin = false;
+            _escapeTapReleaseAt = DateTime.MinValue;
+        }
+    }
+
     internal void ReleaseAllPluginInputsNow(bool force = false, string reason = "Follower.InputScheduler.ReleaseAllPluginInputsNow")
     {
         using var __profileScope = ProfileScope(reason);
         ReleaseMovementKeyNow(force);
         ReleaseDodgeSprintKeyNow(force);
+        if (force) ReleaseEscapeKeyNow();
     }
 
     internal void PrepareForPluginMouseAction(string reason = "Follower.InputScheduler.PrepareForPluginMouseAction")
@@ -607,9 +643,10 @@ private Random random = new Random();
             ? "Follower.PartyChatCommands.PluginPause.Escape"
             : "Follower.PartyChatCommands.PluginResume.Escape");
 
-        ReleaseAllPluginInputsNow(force: true, reason: paused
-            ? "Follower.PartyChatCommands.PluginPause.ReleaseAfterEsc"
-            : "Follower.PartyChatCommands.PluginResume.ReleaseAfterEsc");
+        // ESC is released asynchronously by ProcessPendingInputReleases; keep movement/sprint released
+        // without cancelling the queued ESC tap in the same Render frame.
+        ReleaseMovementKeyNow(force: true);
+        ReleaseDodgeSprintKeyNow(force: true);
 
         try
         {
@@ -623,12 +660,12 @@ private Random random = new Random();
         using var __profileScope = ProfileScope(reason);
         try
         {
+            var now = DateTime.Now;
             Keyboard.KeyUp(Keys.Escape);
-            Thread.Sleep(15);
             Keyboard.KeyDown(Keys.Escape);
-            Thread.Sleep(35);
-            Keyboard.KeyUp(Keys.Escape);
-            Thread.Sleep(25);
+            _escapeTapDownByPlugin = true;
+            _escapeTapReleaseAt = now.AddMilliseconds(45);
+            _nextForcedInputReleaseAt = now.AddMilliseconds(110);
         }
         catch { }
     }
@@ -701,6 +738,21 @@ if (Settings.General.ToggleFollower.PressedOnce())
 }
 finally { _spikeProfiler?.End("Option.ToggleFollower/IsFollowEnabled", __toggleProfileStart); }
 
+if (Settings.General.PanicPauseHotkey.PressedOnce())
+{
+    _wholePluginPausedByPartyChatCommand = true;
+    _pausedByPartyChatCommand = true;
+    _tasks.Clear();
+    ResetTaskWatchdog();
+    ResetPendingPortalClick();
+    ResetPendingArenaTransitionClick();
+    _pickUpManager?.Reset("PanicPauseHotkey");
+    ReleaseAllPluginInputsNow(force: true, reason: "Follower.PanicPauseHotkey.Release");
+    SetRuntimeStatus("Panic", "Whole plugin paused and all plugin inputs released", "");
+    try { LogMessage("Follower: panic pause hotkey pressed; plugin paused and inputs released.", 5); } catch { }
+    return;
+}
+
 var __autoPartyDebugHotkeyProfileStart = _spikeProfiler?.Begin("Option.AutoPartyHoverContextDumpHotkey") ?? 0L;
 try { _autoParty?.TickDebugHotkey(); }
 finally { _spikeProfiler?.End("Option.AutoPartyHoverContextDumpHotkey", __autoPartyDebugHotkeyProfileStart); }
@@ -719,7 +771,10 @@ var __tradeDumpProfileStart = _spikeProfiler?.Begin("Option.TradeInventoryDump")
 try
 {
     if (_tradeInventoryDump?.Tick() == true)
+    {
+        SetRuntimeStatus("TradeDump", _tradeInventoryDump.Status, "");
         return;
+    }
 }
 finally { _spikeProfiler?.End("Option.TradeInventoryDump", __tradeDumpProfileStart); }
 
@@ -748,18 +803,35 @@ if (IsInventoryOpen())
 finally { _spikeProfiler?.End("Option.PauseWhenInventoryOpen", __inventoryProfileStart); }
 
 var __autoPartyProfileStart = _spikeProfiler?.Begin("Option.AutoAcceptParty/AutoAcceptTrade") ?? 0L;
-try { _autoParty?.Tick(); }
+try
+{
+    if (_autoParty?.Tick() == true)
+    {
+        SetRuntimeStatus("AutoParty", _autoParty.Status, "");
+        return;
+    }
+}
 finally { _spikeProfiler?.End("Option.AutoAcceptParty/AutoAcceptTrade", __autoPartyProfileStart); }
 
 var __partyTeleportProfileStart = _spikeProfiler?.Begin("Option.TeleportToLeader") ?? 0L;
-try { _partyTeleport?.Tick(); }
+try
+{
+    if (_partyTeleport?.Tick() == true)
+    {
+        SetRuntimeStatus("PartyTeleport", _partyTeleport.Status, "");
+        return;
+    }
+}
 finally { _spikeProfiler?.End("Option.TeleportToLeader", __partyTeleportProfileStart); }
 
 var __pickUpProfileStart = _spikeProfiler?.Begin("Option.PickUp") ?? 0L;
 try
 {
     if (_pickUpManager?.Tick() == true)
+    {
+        SetRuntimeStatus("PickUp", _pickUpManager.Status, "");
         return;
+    }
 }
 finally { _spikeProfiler?.End("Option.PickUp", __pickUpProfileStart); }
 
@@ -922,6 +994,19 @@ finally { _spikeProfiler?.End("Option.PickUp", __pickUpProfileStart); }
 }
             }
 
+            if (ShouldResetCurrentTaskForStuck(currentTask, taskDistance, playerDistanceMoved))
+            {
+                SetRuntimeStatus("AntiStuck", $"reset {currentTask.Type} after no progress", $"distance={taskDistance:0}");
+                ResetPendingPortalClick();
+                ResetPendingArenaTransitionClick();
+                _tasks.RemoveAt(0);
+                _watchdogResetCount++;
+                ResetTaskWatchdog();
+                ReleaseAllPluginInputsNow(force: true, reason: "Follower.AntiStuck.Release");
+                _nextBotAction = DateTime.Now.AddMilliseconds(SafeBotInputFrequencyMs() * 2);
+                return;
+            }
+
             var __taskProfileName = "TaskExecution." + currentTask.Type + "/BotInputFrequency/MovementKey";
             if (currentTask.Type == TaskNode.TaskNodeType.Movement) __taskProfileName += "/Sprint";
             var __taskProfileStart = _spikeProfiler?.Begin(__taskProfileName) ?? 0L;
@@ -930,6 +1015,7 @@ finally { _spikeProfiler?.End("Option.PickUp", __pickUpProfileStart); }
             switch (currentTask.Type)
             {
                 case TaskNode.TaskNodeType.Movement:
+                    SetRuntimeStatus("Follow", $"moving to task, distance={taskDistance:0}", $"tasks={_tasks.Count}");
                     _nextBotAction = DateTime.Now.AddMilliseconds(SafeBotDelayMs());
 
                     var __sprintProfileStart = ProfileBegin("Follower.Sprint.UpdateDodgeSprintFSM");
@@ -958,6 +1044,7 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
                     break;
                 case TaskNode.TaskNodeType.Loot:
                     {
+                        SetRuntimeStatus("QuestLoot", $"distance={taskDistance:0}", $"attempts={currentTask.AttemptCount}");
                         _nextBotAction = DateTime.Now.AddMilliseconds(SafeBotDelayMs());
                         currentTask.AttemptCount++;
                         var __lootTaskLookupProfileStart = ProfileBegin("Follower.Task.Loot.GetLootableQuestItem");
@@ -991,6 +1078,7 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
                     }
                 case TaskNode.TaskNodeType.Transition:
                     {
+                        SetRuntimeStatus("Transition", $"distance={taskDistance:0}", "resolving portal/transition");
                         _nextBotAction = DateTime.Now.AddMilliseconds(SafeBotDelayMs(2));
 
                         // Re-resolve the portal every tick. Visible UI labels are preferred; entity metadata is
@@ -1066,6 +1154,7 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
 
                 case TaskNode.TaskNodeType.ArenaTransition:
                     {
+                        SetRuntimeStatus("ArenaTransition", $"distance={taskDistance:0}", "visible label/entity transition");
                         _nextBotAction = DateTime.Now.AddMilliseconds(SafeBotDelayMs(2));
 
                         var target = _activeArenaTransitionIsAbyssSubArea
@@ -1103,6 +1192,7 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
 
                 case TaskNode.TaskNodeType.ClaimWaypoint:
                     {
+                        SetRuntimeStatus("Waypoint", $"distance={taskDistance:0}", "claim waypoint");
                         if (Vector3.Distance(GameController.Player.Pos, currentTask.WorldPosition) > 150)
                         {
                             var __waypointScreenProfileStart = ProfileBegin("Follower.Task.ClaimWaypoint.WorldToScreen");
@@ -1125,12 +1215,13 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
             finally { _spikeProfiler?.End(__taskProfileName, __taskProfileStart); }
         }
         _lastPlayerPosition = GameController.Player.Pos;
+        if (Settings.Debug.DrawPathAndTransitions.Value)
+            DrawPath();
         return;
-
-        DrawPath();
         }
         finally
         {
+            DrawRuntimeOverlaySafe();
             _spikeProfiler?.End("Render.Total", __renderProfileStart);
             _spikeProfiler?.FlushIfNeeded();
         }
@@ -1138,6 +1229,96 @@ if (false && CheckDashTerrain(currentTask.WorldPosition))
 
     
     
+    private void SetRuntimeStatus(string mode, string detail = "", string target = "")
+    {
+        _runtimeMode = string.IsNullOrWhiteSpace(mode) ? "Idle" : mode;
+        _runtimeDetail = detail ?? string.Empty;
+        _runtimeTarget = target ?? string.Empty;
+        _runtimeStatusAt = DateTime.Now;
+    }
+
+    private void DrawRuntimeOverlaySafe()
+    {
+        try
+        {
+            if (!(Settings.Debug.ShowRuntimeOverlay?.Value ?? false))
+                return;
+
+            var x = Settings.Debug.RuntimeOverlayX.Value;
+            var y = Settings.Debug.RuntimeOverlayY.Value;
+            var line = 0;
+            void DrawLine(string text)
+            {
+                Graphics.DrawText(text ?? string.Empty, new Vector2(x, y + line * 18));
+                line++;
+            }
+
+            DrawLine($"Follower mode: {_runtimeMode}");
+            if (!string.IsNullOrWhiteSpace(_runtimeDetail)) DrawLine($"Detail: {_runtimeDetail}");
+            if (!string.IsNullOrWhiteSpace(_runtimeTarget)) DrawLine($"Target: {_runtimeTarget}");
+            DrawLine($"Follow: {Settings.General.IsFollowEnabled.Value} | Chat paused: {_pausedByPartyChatCommand} | Whole paused: {_wholePluginPausedByPartyChatCommand}");
+            DrawLine($"Tasks: {_tasks?.Count ?? 0} | Watchdog resets: {_watchdogResetCount}");
+            if (_tradeInventoryDump?.IsActive == true) DrawLine("TradeDump: " + _tradeInventoryDump.Status);
+            if (_pickUpManager?.IsActive == true) DrawLine("PickUp: " + _pickUpManager.Status);
+            if (_partyTeleport != null && !string.IsNullOrWhiteSpace(_partyTeleport.Status)) DrawLine("TP: " + _partyTeleport.Status);
+        }
+        catch { }
+    }
+
+    private void ResetTaskWatchdog()
+    {
+        _watchdogTaskType = null;
+        _watchdogTaskPosition = Vector3.Zero;
+        _watchdogTaskStartedAt = DateTime.MinValue;
+        _watchdogLastProgressAt = DateTime.MinValue;
+        _watchdogBestTaskDistance = float.MaxValue;
+    }
+
+    private bool ShouldResetCurrentTaskForStuck(TaskNode currentTask, float taskDistance, float playerDistanceMoved)
+    {
+        try
+        {
+            if (!(Settings.General.AntiStuckWatchdog?.Value ?? true) || currentTask == null)
+            {
+                ResetTaskWatchdog();
+                return false;
+            }
+
+            var now = DateTime.Now;
+            var minProgress = Math.Max(10, Settings.General.AntiStuckMinProgressDistance.Value);
+            var timeoutMs = Math.Max(1500, Settings.General.AntiStuckNoProgressMs.Value);
+            var newTask = !_watchdogTaskType.HasValue ||
+                          _watchdogTaskType.Value != currentTask.Type ||
+                          Vector3.Distance(_watchdogTaskPosition, currentTask.WorldPosition) > Math.Max(120, minProgress * 3);
+
+            if (newTask)
+            {
+                _watchdogTaskType = currentTask.Type;
+                _watchdogTaskPosition = currentTask.WorldPosition;
+                _watchdogTaskStartedAt = now;
+                _watchdogLastProgressAt = now;
+                _watchdogBestTaskDistance = taskDistance;
+                return false;
+            }
+
+            if (playerDistanceMoved >= minProgress || taskDistance <= _watchdogBestTaskDistance - minProgress)
+            {
+                _watchdogLastProgressAt = now;
+                _watchdogBestTaskDistance = Math.Min(_watchdogBestTaskDistance, taskDistance);
+                return false;
+            }
+
+            var taskAgeMs = (now - _watchdogTaskStartedAt).TotalMilliseconds;
+            var noProgressMs = (now - _watchdogLastProgressAt).TotalMilliseconds;
+            return taskAgeMs >= timeoutMs && noProgressMs >= timeoutMs;
+        }
+        catch
+        {
+            ResetTaskWatchdog();
+            return false;
+        }
+    }
+
     // Lightweight fallback terrain lookup used by CheckDashTerrain.
     private static byte GetTile(int x, int y)
     {

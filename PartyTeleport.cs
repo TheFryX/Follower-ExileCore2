@@ -27,6 +27,8 @@ namespace Follower
 
         public PartyTeleport(Follower plugin) { _plugin = plugin; }
 
+        public string Status { get; private set; } = "Idle";
+
         private dynamic UI => _plugin.GameController.IngameState?.IngameUi;
 
         // PoE2 map names (treated as "leader is in a map")
@@ -45,23 +47,30 @@ namespace Follower
             "Untainted Paradise","Vaal City","Vaal Village","Vaults of Kamasa","Wayward Isle","Wetlands","Willow","Woodland","Atziri's Temple","Abyssal Depths"
         };
 
-        public void Tick()
+        public bool Tick()
         {
             using var __profileScope = _plugin.ProfileScope("PartyTeleport.Tick.Total");
             var s = _plugin.Settings;
-            if (!s.Enable) return;
+            Status = "Idle";
+            if (!s.Enable)
+            {
+                Status = "plugin disabled";
+                return false;
+            }
 
-            // Pending TP handling: check success or retry
+            // Pending TP handling: check success or retry. While pending, block follow/pickup input.
             if (_tpPending)
             {
                 string leaderNow = (s.General.LeaderName?.Value ?? string.Empty);
+                Status = $"pending confirmation/check attempt={_tpAttemptCount}";
 
                 if (IsLoading() || AreaNameChangedSinceAttempt() || InSameAreaAsLeader(leaderNow))
                 {
                     _tpPending = false;
                     _tpAttemptCount = 0;
                     _retryCount = 0;
-                    return;
+                    Status = "teleport completed or area changed";
+                    return false;
                 }
 
                 var elapsed = (DateTime.UtcNow - _tpStartTime).TotalMilliseconds;
@@ -69,33 +78,50 @@ namespace Follower
                 {
                     if (_tpAttemptCount < s.TpTrade.TpConfirmRetries.Value)
                     {
-                        // Re-try: click OK if dialog is open, else open dialog again
-                        if (!TryConfirmTeleportDialog())
+                        // Re-try: click OK if dialog is open, else open dialog again.
+                        if (TryConfirmTeleportDialog())
                         {
-                            TryClickPartyTp(leaderNow);
+                            Status = "retry: confirmed teleport dialog";
+                            return true;
                         }
-                        // MarkTeleportAttemptStarted() is called inside click helpers if they succeed
+
+                        if (TryClickPartyTp(leaderNow))
+                        {
+                            Status = "retry: clicked party TP";
+                            return true;
+                        }
                     }
                     else
                     {
                         _tpPending = false; // give up for now
                         _tpAttemptCount = 0;
+                        Status = "confirm timeout; giving up";
+                        return false;
                     }
                 }
-                return; // pause normal flow while awaiting teleport
+
+                return true;
             }
 
-            if (!s.TpTrade.TeleportToLeader.Value) return;
-
-            // Keep confirming dialog fast if it exists
-            if (s.TpTrade.AutoConfirmTeleportDialog.Value)
+            if (!s.TpTrade.TeleportToLeader.Value)
             {
-                if (TryConfirmTeleportDialog())
-                    return; // we just pressed OK and started pending state
+                Status = "disabled by setting";
+                return false;
             }
 
-            // throttle TP attempts
-            if ((DateTime.UtcNow - _nextAttempt).TotalMilliseconds < s.TpTrade.TpPollMs.Value) return;
+            // Keep confirming dialog fast if it exists.
+            if (s.TpTrade.AutoConfirmTeleportDialog.Value && TryConfirmTeleportDialog())
+            {
+                Status = "confirmed teleport dialog";
+                return true;
+            }
+
+            // Throttle TP attempts.
+            if ((DateTime.UtcNow - _nextAttempt).TotalMilliseconds < s.TpTrade.TpPollMs.Value)
+            {
+                Status = "throttled";
+                return false;
+            }
             _nextAttempt = DateTime.UtcNow;
 
             var area = _plugin.GameController.Area?.CurrentArea;
@@ -111,9 +137,18 @@ namespace Follower
                 _lastLeader = leader;
                 _hideoutTpDone = false;
             }
-            if (string.IsNullOrEmpty(leader)) return;
+            if (string.IsNullOrEmpty(leader))
+            {
+                Status = "no leader configured";
+                return false;
+            }
 
-            if (InSameAreaAsLeader(leader)) { _retryCount = 0; return; }
+            if (InSameAreaAsLeader(leader))
+            {
+                _retryCount = 0;
+                Status = "leader already in same area";
+                return false;
+            }
 
             string rowText = GetLeaderRowText(leader) ?? string.Empty;
             string rowLower = rowText.ToLowerInvariant();
@@ -130,18 +165,39 @@ namespace Follower
             {
                 if (s.TpTrade.TeleportFromHideout.Value && !_hideoutTpDone && leaderInHideout)
                 {
-                    if (TryClickPartyTp(leader)) { _hideoutTpDone = true; _retryCount++; }
+                    if (TryClickPartyTp(leader))
+                    {
+                        _hideoutTpDone = true;
+                        _retryCount++;
+                        Status = "clicked TP from hideout to leader hideout";
+                        return true;
+                    }
                 }
-                return;
+
+                Status = "in hideout; no TP action";
+                return false;
             }
 
-            // If leader is in a map (PoE2), don't TP; use follow/portal
-            if (leaderInMap) { _retryCount = 0; return; }
+            // If leader is in a map (PoE2), don't TP; use follow/portal.
+            if (leaderInMap)
+            {
+                _retryCount = 0;
+                Status = "leader in map; use portal/follow";
+                return false;
+            }
 
-            // From acts/towns/etc -> try TP
-            if (TryClickPartyTp(leader)) _retryCount++;
+            // From acts/towns/etc -> try TP.
+            if (TryClickPartyTp(leader))
+            {
+                _retryCount++;
+                Status = $"clicked party TP retry={_retryCount}";
+                if (_retryCount > s.TpTrade.TpMaxRetries.Value) { _retryCount = 0; }
+                return true;
+            }
 
             if (_retryCount > s.TpTrade.TpMaxRetries.Value) { _retryCount = 0; }
+            Status = "no usable TP button";
+            return false;
         }
 
         private string GetLeaderRowText(string leaderName)
@@ -580,7 +636,7 @@ namespace Follower
             {
                 var c = new Vector2(rect.Center.X, rect.Center.Y);
                 _plugin.PrepareForPluginMouseAction("PartyTeleport.ClickCenter.Prepare");
-                Mouse.SetCursorPosAndLeftClick(c, 1);
+                Mouse.SetCursorPosAndLeftClick(c, 0);
                 _plugin.CompletePluginMouseAction("PartyTeleport.ClickCenter.Complete");
             }
             catch { }
